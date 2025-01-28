@@ -11,6 +11,9 @@ import (
 
 	"github.com/miekg/dns"
 	log "github.com/sirupsen/logrus"
+
+	"github.com/netbirdio/netbird/client/internal/ebpf"
+	ebpfMgr "github.com/netbirdio/netbird/client/internal/ebpf/manager"
 )
 
 const (
@@ -24,10 +27,11 @@ type serviceViaListener struct {
 	dnsMux            *dns.ServeMux
 	customAddr        *netip.AddrPort
 	server            *dns.Server
-	runtimeIP         string
-	runtimePort       int
+	listenIP          string
+	listenPort        uint16
 	listenerIsRunning bool
 	listenerFlagLock  sync.Mutex
+	ebpfService       ebpfMgr.Manager
 }
 
 func newServiceViaListener(wgIface WGIface, customAddr *netip.AddrPort) *serviceViaListener {
@@ -43,6 +47,7 @@ func newServiceViaListener(wgIface WGIface, customAddr *netip.AddrPort) *service
 			UDPSize: 65535,
 		},
 	}
+
 	return s
 }
 
@@ -55,13 +60,12 @@ func (s *serviceViaListener) Listen() error {
 	}
 
 	var err error
-	s.runtimeIP, s.runtimePort, err = s.evalRuntimeAddress()
+	s.listenIP, s.listenPort, err = s.evalListenAddress()
 	if err != nil {
 		log.Errorf("failed to eval runtime address: %s", err)
-		return err
+		return fmt.Errorf("eval listen address: %w", err)
 	}
-	s.server.Addr = fmt.Sprintf("%s:%d", s.runtimeIP, s.runtimePort)
-
+	s.server.Addr = fmt.Sprintf("%s:%d", s.listenIP, s.listenPort)
 	log.Debugf("starting dns on %s", s.server.Addr)
 	go func() {
 		s.setListenerStatus(true)
@@ -69,9 +73,10 @@ func (s *serviceViaListener) Listen() error {
 
 		err := s.server.ListenAndServe()
 		if err != nil {
-			log.Errorf("dns server running with %d port returned an error: %v. Will not retry", s.runtimePort, err)
+			log.Errorf("dns server running with %d port returned an error: %v. Will not retry", s.listenPort, err)
 		}
 	}()
+
 	return nil
 }
 
@@ -90,9 +95,17 @@ func (s *serviceViaListener) Stop() {
 	if err != nil {
 		log.Errorf("stopping dns server listener returned an error: %v", err)
 	}
+
+	if s.ebpfService != nil {
+		err = s.ebpfService.FreeDNSFwd()
+		if err != nil {
+			log.Errorf("stopping traffic forwarder returned an error: %v", err)
+		}
+	}
 }
 
 func (s *serviceViaListener) RegisterMux(pattern string, handler dns.Handler) {
+	log.Debugf("registering dns handler for pattern: %s", pattern)
 	s.dnsMux.Handle(pattern, handler)
 }
 
@@ -101,45 +114,133 @@ func (s *serviceViaListener) DeregisterMux(pattern string) {
 }
 
 func (s *serviceViaListener) RuntimePort() int {
-	return s.runtimePort
+	s.listenerFlagLock.Lock()
+	defer s.listenerFlagLock.Unlock()
+
+	if s.ebpfService != nil {
+		return defaultPort
+	} else {
+		return int(s.listenPort)
+	}
 }
 
 func (s *serviceViaListener) RuntimeIP() string {
-	return s.runtimeIP
+	return s.listenIP
 }
 
 func (s *serviceViaListener) setListenerStatus(running bool) {
+	s.listenerFlagLock.Lock()
+	defer s.listenerFlagLock.Unlock()
+
 	s.listenerIsRunning = running
 }
 
-func (s *serviceViaListener) getFirstListenerAvailable() (string, int, error) {
-	ips := []string{defaultIP, customIP}
-	if runtime.GOOS != "darwin" {
-		ips = append([]string{s.wgInterface.Address().IP.String()}, ips...)
+// evalListenAddress figure out the listen address for the DNS server
+// first check the 53 port availability on WG interface or lo, if not success
+// pick a random port on WG interface for eBPF, if not success
+// check the 5053 port availability on WG interface or lo without eBPF usage,
+func (s *serviceViaListener) evalListenAddress() (string, uint16, error) {
+	if s.customAddr != nil {
+		return s.customAddr.Addr().String(), s.customAddr.Port(), nil
 	}
-	ports := []int{defaultPort, customPort}
-	for _, port := range ports {
-		for _, ip := range ips {
-			addrString := fmt.Sprintf("%s:%d", ip, port)
-			udpAddr := net.UDPAddrFromAddrPort(netip.MustParseAddrPort(addrString))
-			probeListener, err := net.ListenUDP("udp", udpAddr)
-			if err == nil {
-				err = probeListener.Close()
-				if err != nil {
-					log.Errorf("got an error closing the probe listener, error: %s", err)
-				}
-				return ip, port, nil
-			}
-			log.Warnf("binding dns on %s is not available, error: %s", addrString, err)
-		}
+
+	ip, ok := s.testFreePort(defaultPort)
+	if ok {
+		return ip, defaultPort, nil
 	}
-	return "", 0, fmt.Errorf("unable to find an unused ip and port combination. IPs tested: %v and ports %v", ips, ports)
+
+	ebpfSrv, port, ok := s.tryToUseeBPF()
+	if ok {
+		s.ebpfService = ebpfSrv
+		return s.wgInterface.Address().IP.String(), port, nil
+	}
+
+	ip, ok = s.testFreePort(customPort)
+	if ok {
+		return ip, customPort, nil
+	}
+
+	return "", 0, fmt.Errorf("failed to find a free port for DNS server")
 }
 
-func (s *serviceViaListener) evalRuntimeAddress() (string, int, error) {
-	if s.customAddr != nil {
-		return s.customAddr.Addr().String(), int(s.customAddr.Port()), nil
+func (s *serviceViaListener) testFreePort(port int) (string, bool) {
+	var ips []string
+	if runtime.GOOS != "darwin" {
+		ips = []string{s.wgInterface.Address().IP.String(), defaultIP, customIP}
+	} else {
+		ips = []string{defaultIP, customIP}
 	}
 
-	return s.getFirstListenerAvailable()
+	for _, ip := range ips {
+		if !s.tryToBind(ip, port) {
+			continue
+		}
+
+		return ip, true
+	}
+	return "", false
+}
+
+func (s *serviceViaListener) tryToBind(ip string, port int) bool {
+	addrString := fmt.Sprintf("%s:%d", ip, port)
+	udpAddr := net.UDPAddrFromAddrPort(netip.MustParseAddrPort(addrString))
+	probeListener, err := net.ListenUDP("udp", udpAddr)
+	if err != nil {
+		log.Warnf("binding dns on %s is not available, error: %s", addrString, err)
+		return false
+	}
+
+	err = probeListener.Close()
+	if err != nil {
+		log.Errorf("got an error closing the probe listener, error: %s", err)
+	}
+	return true
+}
+
+// tryToUseeBPF decides whether to apply eBPF program to capture DNS traffic on port 53.
+// This is needed because on some operating systems if we start a DNS server not on a default port 53,
+// the domain name  resolution won't work. So, in case we are running on Linux and picked a free
+// port we should fall back to the eBPF solution that will capture traffic on port 53 and forward
+// it to a local DNS server running on the chosen port.
+func (s *serviceViaListener) tryToUseeBPF() (ebpfMgr.Manager, uint16, bool) {
+	if runtime.GOOS != "linux" {
+		return nil, 0, false
+	}
+
+	port, err := s.generateFreePort() //nolint:staticcheck,unused
+	if err != nil {
+		log.Warnf("failed to generate a free port for eBPF DNS forwarder server: %s", err)
+		return nil, 0, false
+	}
+
+	ebpfSrv := ebpf.GetEbpfManagerInstance()
+	err = ebpfSrv.LoadDNSFwd(s.wgInterface.Address().IP.String(), int(port))
+	if err != nil {
+		log.Warnf("failed to load DNS forwarder eBPF program, error: %s", err)
+		return nil, 0, false
+	}
+
+	return ebpfSrv, port, true
+}
+
+func (s *serviceViaListener) generateFreePort() (uint16, error) {
+	ok := s.tryToBind(s.wgInterface.Address().IP.String(), customPort)
+	if ok {
+		return customPort, nil
+	}
+
+	udpAddr := net.UDPAddrFromAddrPort(netip.MustParseAddrPort("0.0.0.0:0"))
+	probeListener, err := net.ListenUDP("udp", udpAddr)
+	if err != nil {
+		log.Debugf("failed to bind random port for DNS: %s", err)
+		return 0, err
+	}
+
+	addrPort := netip.MustParseAddrPort(probeListener.LocalAddr().String()) // might panic if address is incorrect
+	err = probeListener.Close()
+	if err != nil {
+		log.Debugf("failed to free up DNS port: %s", err)
+		return 0, err
+	}
+	return addrPort.Port(), nil
 }

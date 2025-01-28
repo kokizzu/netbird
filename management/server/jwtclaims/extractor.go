@@ -2,6 +2,7 @@ package jwtclaims
 
 import (
 	"net/http"
+	"time"
 
 	"github.com/golang-jwt/jwt"
 )
@@ -17,6 +18,12 @@ const (
 	DomainCategorySuffix = "wt_account_domain_category"
 	// UserIDClaim claim for the user id
 	UserIDClaim = "sub"
+	// LastLoginSuffix claim for the last login
+	LastLoginSuffix = "nb_last_login"
+	// Invited claim indicates that an incoming JWT is from a user that just accepted an invitation
+	Invited = "nb_invited"
+	// IsToken claim indicates that auth type from the user is a token
+	IsToken = "is_token"
 )
 
 // ExtractClaims Extract function type
@@ -93,7 +100,26 @@ func (c *ClaimsExtractor) FromToken(token *jwt.Token) AuthorizationClaims {
 	if ok {
 		jwtClaims.DomainCategory = domainCategoryClaim.(string)
 	}
+	LastLoginClaimString, ok := claims[c.authAudience+LastLoginSuffix]
+	if ok {
+		jwtClaims.LastLogin = parseTime(LastLoginClaimString.(string))
+	}
+	invitedBool, ok := claims[c.authAudience+Invited]
+	if ok {
+		jwtClaims.Invited = invitedBool.(bool)
+	}
 	return jwtClaims
+}
+
+func parseTime(timeString string) time.Time {
+	if timeString == "" {
+		return time.Time{}
+	}
+	parsedTime, err := time.Parse(time.RFC3339, timeString)
+	if err != nil {
+		return time.Time{}
+	}
+	return parsedTime
 }
 
 // fromRequestContext extracts claims from the request context previously filled by the JWT token (after auth)

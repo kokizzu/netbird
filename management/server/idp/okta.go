@@ -8,9 +8,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/netbirdio/netbird/management/server/telemetry"
 	"github.com/okta/okta-sdk-golang/v2/okta"
 	"github.com/okta/okta-sdk-golang/v2/okta/query"
+
+	"github.com/netbirdio/netbird/management/server/telemetry"
 )
 
 // OktaManager okta manager client instance.
@@ -76,11 +77,6 @@ func NewOktaManager(config OktaClientConfig, appMetrics telemetry.AppMetrics) (*
 		return nil, err
 	}
 
-	err = updateUserProfileSchema(client)
-	if err != nil {
-		return nil, err
-	}
-
 	credentials := &OktaCredentials{
 		clientConfig: config,
 		httpClient:   httpClient,
@@ -98,58 +94,17 @@ func NewOktaManager(config OktaClientConfig, appMetrics telemetry.AppMetrics) (*
 }
 
 // Authenticate retrieves access token to use the okta user API.
-func (oc *OktaCredentials) Authenticate() (JWTToken, error) {
+func (oc *OktaCredentials) Authenticate(_ context.Context) (JWTToken, error) {
 	return JWTToken{}, nil
 }
 
 // CreateUser creates a new user in okta Idp and sends an invitation.
-func (om *OktaManager) CreateUser(email string, name string, accountID string) (*UserData, error) {
-	var (
-		sendEmail   = true
-		activate    = true
-		userProfile = okta.UserProfile{
-			"email":         email,
-			"login":         email,
-			wtAccountID:     accountID,
-			wtPendingInvite: true,
-		}
-	)
-
-	fields := strings.Fields(name)
-	if n := len(fields); n > 0 {
-		userProfile["firstName"] = strings.Join(fields[:n-1], " ")
-		userProfile["lastName"] = fields[n-1]
-	}
-
-	user, resp, err := om.client.User.CreateUser(context.Background(),
-		okta.CreateUserRequest{
-			Profile: &userProfile,
-		},
-		&query.Params{
-			Activate:  &activate,
-			SendEmail: &sendEmail,
-		},
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	if om.appMetrics != nil {
-		om.appMetrics.IDPMetrics().CountCreateUser()
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		if om.appMetrics != nil {
-			om.appMetrics.IDPMetrics().CountRequestStatusError()
-		}
-		return nil, fmt.Errorf("unable to create user, statusCode %d", resp.StatusCode)
-	}
-
-	return parseOktaUser(user)
+func (om *OktaManager) CreateUser(_ context.Context, _, _, _, _ string) (*UserData, error) {
+	return nil, fmt.Errorf("method CreateUser not implemented")
 }
 
 // GetUserDataByID requests user data from keycloak via ID.
-func (om *OktaManager) GetUserDataByID(userID string, appMetadata AppMetadata) (*UserData, error) {
+func (om *OktaManager) GetUserDataByID(_ context.Context, userID string, appMetadata AppMetadata) (*UserData, error) {
 	user, resp, err := om.client.User.GetUser(context.Background(), userID)
 	if err != nil {
 		return nil, err
@@ -166,12 +121,18 @@ func (om *OktaManager) GetUserDataByID(userID string, appMetadata AppMetadata) (
 		return nil, fmt.Errorf("unable to get user %s, statusCode %d", userID, resp.StatusCode)
 	}
 
-	return parseOktaUser(user)
+	userData, err := parseOktaUser(user)
+	if err != nil {
+		return nil, err
+	}
+	userData.AppMetadata = appMetadata
+
+	return userData, nil
 }
 
 // GetUserByEmail searches users with a given email.
 // If no users have been found, this function returns an empty list.
-func (om *OktaManager) GetUserByEmail(email string) ([]*UserData, error) {
+func (om *OktaManager) GetUserByEmail(_ context.Context, email string) ([]*UserData, error) {
 	user, resp, err := om.client.User.GetUser(context.Background(), url.QueryEscape(email))
 	if err != nil {
 		return nil, err
@@ -199,9 +160,8 @@ func (om *OktaManager) GetUserByEmail(email string) ([]*UserData, error) {
 }
 
 // GetAccount returns all the users for a given profile.
-func (om *OktaManager) GetAccount(accountID string) ([]*UserData, error) {
-	search := fmt.Sprintf("profile.wt_account_id eq %q", accountID)
-	users, resp, err := om.client.User.ListUsers(context.Background(), &query.Params{Search: search})
+func (om *OktaManager) GetAccount(_ context.Context, accountID string) ([]*UserData, error) {
+	users, err := om.getAllUsers()
 	if err != nil {
 		return nil, err
 	}
@@ -210,36 +170,38 @@ func (om *OktaManager) GetAccount(accountID string) ([]*UserData, error) {
 		om.appMetrics.IDPMetrics().CountGetAccount()
 	}
 
-	if resp.StatusCode != http.StatusOK {
-		if om.appMetrics != nil {
-			om.appMetrics.IDPMetrics().CountRequestStatusError()
-		}
-		return nil, fmt.Errorf("unable to get account, statusCode %d", resp.StatusCode)
+	for index, user := range users {
+		user.AppMetadata.WTAccountID = accountID
+		users[index] = user
 	}
 
-	list := make([]*UserData, 0)
-	for _, user := range users {
-		userData, err := parseOktaUser(user)
-		if err != nil {
-			return nil, err
-		}
-
-		list = append(list, userData)
-	}
-
-	return list, nil
+	return users, nil
 }
 
 // GetAllAccounts gets all registered accounts with corresponding user data.
 // It returns a list of users indexed by accountID.
-func (om *OktaManager) GetAllAccounts() (map[string][]*UserData, error) {
-	users, resp, err := om.client.User.ListUsers(context.Background(), nil)
+func (om *OktaManager) GetAllAccounts(_ context.Context) (map[string][]*UserData, error) {
+	users, err := om.getAllUsers()
 	if err != nil {
 		return nil, err
 	}
 
+	indexedUsers := make(map[string][]*UserData)
+	indexedUsers[UnsetAccountID] = append(indexedUsers[UnsetAccountID], users...)
+
 	if om.appMetrics != nil {
 		om.appMetrics.IDPMetrics().CountGetAllAccounts()
+	}
+
+	return indexedUsers, nil
+}
+
+// getAllUsers returns all users in an Okta account.
+func (om *OktaManager) getAllUsers() ([]*UserData, error) {
+	qp := query.NewQueryParams(query.WithLimit(200))
+	userList, resp, err := om.client.User.ListUsers(context.Background(), qp)
+	if err != nil {
+		return nil, err
 	}
 
 	if resp.StatusCode != http.StatusOK {
@@ -249,130 +211,74 @@ func (om *OktaManager) GetAllAccounts() (map[string][]*UserData, error) {
 		return nil, fmt.Errorf("unable to get all accounts, statusCode %d", resp.StatusCode)
 	}
 
-	indexedUsers := make(map[string][]*UserData)
-	for _, user := range users {
+	for resp.HasNextPage() {
+		paginatedUsers := make([]*okta.User, 0)
+		resp, err = resp.Next(context.Background(), &paginatedUsers)
+		if err != nil {
+			return nil, err
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			if om.appMetrics != nil {
+				om.appMetrics.IDPMetrics().CountRequestStatusError()
+			}
+			return nil, fmt.Errorf("unable to get all accounts, statusCode %d", resp.StatusCode)
+		}
+
+		userList = append(userList, paginatedUsers...)
+	}
+
+	users := make([]*UserData, 0, len(userList))
+	for _, user := range userList {
 		userData, err := parseOktaUser(user)
 		if err != nil {
 			return nil, err
 		}
 
-		accountID := userData.AppMetadata.WTAccountID
-		if accountID != "" {
-			if _, ok := indexedUsers[accountID]; !ok {
-				indexedUsers[accountID] = make([]*UserData, 0)
-			}
-			indexedUsers[accountID] = append(indexedUsers[accountID], userData)
-		}
+		users = append(users, userData)
 	}
 
-	return indexedUsers, nil
+	return users, nil
 }
 
 // UpdateUserAppMetadata updates user app metadata based on userID and metadata map.
-func (om *OktaManager) UpdateUserAppMetadata(userID string, appMetadata AppMetadata) error {
-	user, resp, err := om.client.User.GetUser(context.Background(), userID)
-	if err != nil {
-		return err
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		if om.appMetrics != nil {
-			om.appMetrics.IDPMetrics().CountRequestStatusError()
-		}
-		return fmt.Errorf("unable to update user, statusCode %d", resp.StatusCode)
-	}
-
-	profile := *user.Profile
-
-	if appMetadata.WTPendingInvite != nil {
-		profile[wtPendingInvite] = *appMetadata.WTPendingInvite
-	}
-
-	if appMetadata.WTAccountID != "" {
-		profile[wtAccountID] = appMetadata.WTAccountID
-	}
-
-	user.Profile = &profile
-	_, resp, err = om.client.User.UpdateUser(context.Background(), userID, *user, nil)
-	if err != nil {
-		fmt.Println(err.Error())
-		return err
-	}
-
-	if om.appMetrics != nil {
-		om.appMetrics.IDPMetrics().CountUpdateUserAppMetadata()
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		if om.appMetrics != nil {
-			om.appMetrics.IDPMetrics().CountRequestStatusError()
-		}
-		return fmt.Errorf("unable to update user, statusCode %d", resp.StatusCode)
-	}
-
+func (om *OktaManager) UpdateUserAppMetadata(_ context.Context, _ string, _ AppMetadata) error {
 	return nil
 }
 
 // InviteUserByID resend invitations to users who haven't activated,
 // their accounts prior to the expiration period.
-func (om *OktaManager) InviteUserByID(_ string) error {
+func (om *OktaManager) InviteUserByID(_ context.Context, _ string) error {
 	return fmt.Errorf("method InviteUserByID not implemented")
 }
 
-// updateUserProfileSchema updates the Okta user schema to include custom fields,
-// wt_account_id and wt_pending_invite.
-func updateUserProfileSchema(client *okta.Client) error {
-	// Ensure Okta doesn't enforce user input for these fields, as they are solely used by Netbird
-	userPermissions := []*okta.UserSchemaAttributePermission{{Action: "HIDE", Principal: "SELF"}}
-
-	_, resp, err := client.UserSchema.UpdateUserProfile(
-		context.Background(),
-		"default",
-		okta.UserSchema{
-			Definitions: &okta.UserSchemaDefinitions{
-				Custom: &okta.UserSchemaPublic{
-					Id:   "#custom",
-					Type: "object",
-					Properties: map[string]*okta.UserSchemaAttribute{
-						wtAccountID: {
-							MaxLength:   100,
-							MinLength:   1,
-							Required:    new(bool),
-							Scope:       "NONE",
-							Title:       "Wt Account Id",
-							Type:        "string",
-							Permissions: userPermissions,
-						},
-						wtPendingInvite: {
-							Required:    new(bool),
-							Scope:       "NONE",
-							Title:       "Wt Pending Invite",
-							Type:        "boolean",
-							Permissions: userPermissions,
-						},
-					},
-				},
-			},
-		})
+// DeleteUser from Okta
+func (om *OktaManager) DeleteUser(_ context.Context, userID string) error {
+	resp, err := om.client.User.DeactivateOrDeleteUser(context.Background(), userID, nil)
 	if err != nil {
 		return err
 	}
 
+	if om.appMetrics != nil {
+		om.appMetrics.IDPMetrics().CountDeleteUser()
+	}
+
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("unable to update user profile schema, statusCode %d", resp.StatusCode)
+		if om.appMetrics != nil {
+			om.appMetrics.IDPMetrics().CountRequestStatusError()
+		}
+		return fmt.Errorf("unable to delete user, statusCode %d", resp.StatusCode)
 	}
 
 	return nil
 }
 
-// parseOktaUserToUserData parse okta user to UserData.
+// parseOktaUser parse okta user to UserData.
 func parseOktaUser(user *okta.User) (*UserData, error) {
 	var oktaUser struct {
-		Email         string `json:"email"`
-		FirstName     string `json:"firstName"`
-		LastName      string `json:"lastName"`
-		AccountID     string `json:"wt_account_id"`
-		PendingInvite bool   `json:"wt_pending_invite"`
+		Email     string `json:"email"`
+		FirstName string `json:"firstName"`
+		LastName  string `json:"lastName"`
 	}
 
 	if user == nil {
@@ -396,9 +302,5 @@ func parseOktaUser(user *okta.User) (*UserData, error) {
 		Email: oktaUser.Email,
 		Name:  strings.Join([]string{oktaUser.FirstName, oktaUser.LastName}, " "),
 		ID:    user.Id,
-		AppMetadata: AppMetadata{
-			WTAccountID:     oktaUser.AccountID,
-			WTPendingInvite: &oktaUser.PendingInvite,
-		},
 	}, nil
 }

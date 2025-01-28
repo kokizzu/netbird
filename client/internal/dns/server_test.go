@@ -11,18 +11,25 @@ import (
 	"time"
 
 	"github.com/golang/mock/gomock"
+	"github.com/miekg/dns"
 	log "github.com/sirupsen/logrus"
+	"github.com/stretchr/testify/mock"
+	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 
 	"github.com/netbirdio/netbird/client/firewall/uspfilter"
+	"github.com/netbirdio/netbird/client/iface"
+	"github.com/netbirdio/netbird/client/iface/configurer"
+	"github.com/netbirdio/netbird/client/iface/device"
+	pfmock "github.com/netbirdio/netbird/client/iface/mocks"
+	"github.com/netbirdio/netbird/client/internal/peer"
+	"github.com/netbirdio/netbird/client/internal/statemanager"
 	"github.com/netbirdio/netbird/client/internal/stdnet"
 	nbdns "github.com/netbirdio/netbird/dns"
 	"github.com/netbirdio/netbird/formatter"
-	"github.com/netbirdio/netbird/iface"
-	pfmock "github.com/netbirdio/netbird/iface/mocks"
 )
 
 type mocWGIface struct {
-	filter iface.PacketFilter
+	filter device.PacketFilter
 }
 
 func (w *mocWGIface) Name() string {
@@ -37,11 +44,15 @@ func (w *mocWGIface) Address() iface.WGAddress {
 	}
 }
 
-func (w *mocWGIface) GetFilter() iface.PacketFilter {
+func (w *mocWGIface) ToInterface() *net.Interface {
+	panic("implement me")
+}
+
+func (w *mocWGIface) GetFilter() device.PacketFilter {
 	return w.filter
 }
 
-func (w *mocWGIface) GetDevice() *iface.DeviceWrapper {
+func (w *mocWGIface) GetDevice() *device.FilteredDevice {
 	panic("implement me")
 }
 
@@ -53,9 +64,13 @@ func (w *mocWGIface) IsUserspaceBind() bool {
 	return false
 }
 
-func (w *mocWGIface) SetFilter(filter iface.PacketFilter) error {
+func (w *mocWGIface) SetFilter(filter device.PacketFilter) error {
 	w.filter = filter
 	return nil
+}
+
+func (w *mocWGIface) GetStats(_ string) (configurer.WGStats, error) {
+	return configurer.WGStats{}, nil
 }
 
 var zoneRecords = []nbdns.SimpleRecord{
@@ -250,11 +265,22 @@ func TestUpdateDNSServer(t *testing.T) {
 
 	for n, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
+			privKey, _ := wgtypes.GenerateKey()
 			newNet, err := stdnet.NewNet(nil)
 			if err != nil {
 				t.Fatal(err)
 			}
-			wgIface, err := iface.NewWGIFace(fmt.Sprintf("utun230%d", n), fmt.Sprintf("100.66.100.%d/32", n+1), iface.DefaultMTU, nil, newNet)
+
+			opts := iface.WGIFaceOpts{
+				IFaceName:    fmt.Sprintf("utun230%d", n),
+				Address:      fmt.Sprintf("100.66.100.%d/32", n+1),
+				WGPort:       33100,
+				WGPrivKey:    privKey.String(),
+				MTU:          iface.DefaultMTU,
+				TransportNet: newNet,
+			}
+
+			wgIface, err := iface.NewWGIFace(opts)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -268,7 +294,7 @@ func TestUpdateDNSServer(t *testing.T) {
 					t.Log(err)
 				}
 			}()
-			dnsServer, err := NewDefaultServer(context.Background(), wgIface, "")
+			dnsServer, err := NewDefaultServer(context.Background(), wgIface, "", &peer.Status{}, nil, false)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -322,16 +348,25 @@ func TestUpdateDNSServer(t *testing.T) {
 
 func TestDNSFakeResolverHandleUpdates(t *testing.T) {
 	ov := os.Getenv("NB_WG_KERNEL_DISABLED")
-	defer os.Setenv("NB_WG_KERNEL_DISABLED", ov)
+	defer t.Setenv("NB_WG_KERNEL_DISABLED", ov)
 
-	_ = os.Setenv("NB_WG_KERNEL_DISABLED", "true")
+	t.Setenv("NB_WG_KERNEL_DISABLED", "true")
 	newNet, err := stdnet.NewNet(nil)
 	if err != nil {
 		t.Errorf("create stdnet: %v", err)
 		return
 	}
 
-	wgIface, err := iface.NewWGIFace("utun2301", "100.66.100.1/32", iface.DefaultMTU, nil, newNet)
+	privKey, _ := wgtypes.GeneratePrivateKey()
+	opts := iface.WGIFaceOpts{
+		IFaceName:    "utun2301",
+		Address:      "100.66.100.1/32",
+		WGPort:       33100,
+		WGPrivKey:    privKey.String(),
+		MTU:          iface.DefaultMTU,
+		TransportNet: newNet,
+	}
+	wgIface, err := iface.NewWGIFace(opts)
 	if err != nil {
 		t.Errorf("build interface wireguard: %v", err)
 		return
@@ -339,7 +374,7 @@ func TestDNSFakeResolverHandleUpdates(t *testing.T) {
 
 	err = wgIface.Create()
 	if err != nil {
-		t.Errorf("crate and init wireguard interface: %v", err)
+		t.Errorf("create and init wireguard interface: %v", err)
 		return
 	}
 	defer func() {
@@ -368,7 +403,7 @@ func TestDNSFakeResolverHandleUpdates(t *testing.T) {
 		return
 	}
 
-	dnsServer, err := NewDefaultServer(context.Background(), wgIface, "")
+	dnsServer, err := NewDefaultServer(context.Background(), wgIface, "", &peer.Status{}, nil, false)
 	if err != nil {
 		t.Errorf("create DNS server: %v", err)
 		return
@@ -463,7 +498,7 @@ func TestDNSServerStartStop(t *testing.T) {
 
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
-			dnsServer, err := NewDefaultServer(context.Background(), &mocWGIface{}, testCase.addrPort)
+			dnsServer, err := NewDefaultServer(context.Background(), &mocWGIface{}, testCase.addrPort, &peer.Status{}, nil, false)
 			if err != nil {
 				t.Fatalf("%v", err)
 			}
@@ -479,7 +514,7 @@ func TestDNSServerStartStop(t *testing.T) {
 				t.Error(err)
 			}
 
-			dnsServer.service.RegisterMux("netbird.cloud", dnsServer.localResolver)
+			dnsServer.registerHandler([]string{"netbird.cloud"}, dnsServer.localResolver, 1)
 
 			resolver := &net.Resolver{
 				PreferGo: true,
@@ -522,28 +557,32 @@ func TestDNSServerStartStop(t *testing.T) {
 func TestDNSServerUpstreamDeactivateCallback(t *testing.T) {
 	hostManager := &mockHostConfigurator{}
 	server := DefaultServer{
-		service: newServiceViaMemory(&mocWGIface{}),
+		ctx:     context.Background(),
+		service: NewServiceViaMemory(&mocWGIface{}),
 		localResolver: &localResolver{
 			registeredMap: make(registrationMap),
 		},
-		hostManager: hostManager,
-		currentConfig: hostDNSConfig{
-			domains: []domainConfig{
+		handlerChain:      NewHandlerChain(),
+		handlerPriorities: make(map[string]int),
+		hostManager:       hostManager,
+		currentConfig: HostDNSConfig{
+			Domains: []DomainConfig{
 				{false, "domain0", false},
 				{false, "domain1", false},
 				{false, "domain2", false},
 			},
 		},
+		statusRecorder: &peer.Status{},
 	}
 
 	var domainsUpdate string
-	hostManager.applyDNSConfigFunc = func(config hostDNSConfig) error {
+	hostManager.applyDNSConfigFunc = func(config HostDNSConfig, statemanager *statemanager.Manager) error {
 		domains := []string{}
-		for _, item := range config.domains {
-			if item.disabled {
+		for _, item := range config.Domains {
+			if item.Disabled {
 				continue
 			}
-			domains = append(domains, item.domain)
+			domains = append(domains, item.Domain)
 		}
 		domainsUpdate = strings.Join(domains, ",")
 		return nil
@@ -556,14 +595,14 @@ func TestDNSServerUpstreamDeactivateCallback(t *testing.T) {
 		},
 	}, nil)
 
-	deactivate()
+	deactivate(nil)
 	expected := "domain0,domain2"
 	domains := []string{}
-	for _, item := range server.currentConfig.domains {
-		if item.disabled {
+	for _, item := range server.currentConfig.Domains {
+		if item.Disabled {
 			continue
 		}
-		domains = append(domains, item.domain)
+		domains = append(domains, item.Domain)
 	}
 	got := strings.Join(domains, ",")
 	if expected != got {
@@ -573,11 +612,11 @@ func TestDNSServerUpstreamDeactivateCallback(t *testing.T) {
 	reactivate()
 	expected = "domain0,domain1,domain2"
 	domains = []string{}
-	for _, item := range server.currentConfig.domains {
-		if item.disabled {
+	for _, item := range server.currentConfig.Domains {
+		if item.Disabled {
 			continue
 		}
-		domains = append(domains, item.domain)
+		domains = append(domains, item.Domain)
 	}
 	got = strings.Join(domains, ",")
 	if expected != got {
@@ -593,7 +632,8 @@ func TestDNSPermanent_updateHostDNS_emptyUpstream(t *testing.T) {
 	defer wgIFace.Close()
 
 	var dnsList []string
-	dnsServer := NewDefaultServerPermanentUpstream(context.Background(), wgIFace, dnsList)
+	dnsConfig := nbdns.Config{}
+	dnsServer := NewDefaultServerPermanentUpstream(context.Background(), wgIFace, dnsList, dnsConfig, nil, &peer.Status{}, false)
 	err = dnsServer.Initialize()
 	if err != nil {
 		t.Errorf("failed to initialize DNS server: %v", err)
@@ -616,8 +656,8 @@ func TestDNSPermanent_updateUpstream(t *testing.T) {
 		t.Fatal("failed to initialize wg interface")
 	}
 	defer wgIFace.Close()
-
-	dnsServer := NewDefaultServerPermanentUpstream(context.Background(), wgIFace, []string{"8.8.8.8"})
+	dnsConfig := nbdns.Config{}
+	dnsServer := NewDefaultServerPermanentUpstream(context.Background(), wgIFace, []string{"8.8.8.8"}, dnsConfig, nil, &peer.Status{}, false)
 	err = dnsServer.Initialize()
 	if err != nil {
 		t.Errorf("failed to initialize DNS server: %v", err)
@@ -708,8 +748,8 @@ func TestDNSPermanent_matchOnly(t *testing.T) {
 		t.Fatal("failed to initialize wg interface")
 	}
 	defer wgIFace.Close()
-
-	dnsServer := NewDefaultServerPermanentUpstream(context.Background(), wgIFace, []string{"8.8.8.8"})
+	dnsConfig := nbdns.Config{}
+	dnsServer := NewDefaultServerPermanentUpstream(context.Background(), wgIFace, []string{"8.8.8.8"}, dnsConfig, nil, &peer.Status{}, false)
 	err = dnsServer.Initialize()
 	if err != nil {
 		t.Errorf("failed to initialize DNS server: %v", err)
@@ -740,8 +780,13 @@ func TestDNSPermanent_matchOnly(t *testing.T) {
 						NSType: nbdns.UDPNameServerType,
 						Port:   53,
 					},
+					{
+						IP:     netip.MustParseAddr("9.9.9.9"),
+						NSType: nbdns.UDPNameServerType,
+						Port:   53,
+					},
 				},
-				Domains: []string{"customdomain.com"},
+				Domains: []string{"google.com"},
 				Primary: false,
 			},
 		},
@@ -763,24 +808,36 @@ func TestDNSPermanent_matchOnly(t *testing.T) {
 	if ips[0] != zoneRecords[0].RData {
 		t.Fatalf("invalid zone record: %v", err)
 	}
-	_, err = resolver.LookupHost(context.Background(), "customdomain.com")
+	_, err = resolver.LookupHost(context.Background(), "google.com")
 	if err != nil {
 		t.Errorf("failed to resolve: %s", err)
 	}
 }
 
 func createWgInterfaceWithBind(t *testing.T) (*iface.WGIface, error) {
+	t.Helper()
 	ov := os.Getenv("NB_WG_KERNEL_DISABLED")
-	defer os.Setenv("NB_WG_KERNEL_DISABLED", ov)
+	defer t.Setenv("NB_WG_KERNEL_DISABLED", ov)
 
-	_ = os.Setenv("NB_WG_KERNEL_DISABLED", "true")
+	t.Setenv("NB_WG_KERNEL_DISABLED", "true")
 	newNet, err := stdnet.NewNet(nil)
 	if err != nil {
 		t.Fatalf("create stdnet: %v", err)
-		return nil, nil
+		return nil, err
 	}
 
-	wgIface, err := iface.NewWGIFace("utun2301", "100.66.100.2/24", iface.DefaultMTU, nil, newNet)
+	privKey, _ := wgtypes.GeneratePrivateKey()
+
+	opts := iface.WGIFaceOpts{
+		IFaceName:    "utun2301",
+		Address:      "100.66.100.2/24",
+		WGPort:       33100,
+		WGPrivKey:    privKey.String(),
+		MTU:          iface.DefaultMTU,
+		TransportNet: newNet,
+	}
+
+	wgIface, err := iface.NewWGIFace(opts)
 	if err != nil {
 		t.Fatalf("build interface wireguard: %v", err)
 		return nil, err
@@ -788,7 +845,7 @@ func createWgInterfaceWithBind(t *testing.T) (*iface.WGIface, error) {
 
 	err = wgIface.Create()
 	if err != nil {
-		t.Fatalf("crate and init wireguard interface: %v", err)
+		t.Fatalf("create and init wireguard interface: %v", err)
 		return nil, err
 	}
 
@@ -817,5 +874,88 @@ func newDnsResolver(ip string, port int) *net.Resolver {
 			addr := fmt.Sprintf("%s:%d", ip, port)
 			return d.DialContext(ctx, network, addr)
 		},
+	}
+}
+
+// MockHandler implements dns.Handler interface for testing
+type MockHandler struct {
+	mock.Mock
+}
+
+func (m *MockHandler) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
+	m.Called(w, r)
+}
+
+type MockSubdomainHandler struct {
+	MockHandler
+	Subdomains bool
+}
+
+func (m *MockSubdomainHandler) MatchSubdomains() bool {
+	return m.Subdomains
+}
+
+func TestHandlerChain_DomainPriorities(t *testing.T) {
+	chain := NewHandlerChain()
+
+	dnsRouteHandler := &MockHandler{}
+	upstreamHandler := &MockSubdomainHandler{
+		Subdomains: true,
+	}
+
+	chain.AddHandler("example.com.", dnsRouteHandler, PriorityDNSRoute, nil)
+	chain.AddHandler("example.com.", upstreamHandler, PriorityMatchDomain, nil)
+
+	testCases := []struct {
+		name            string
+		query           string
+		expectedHandler dns.Handler
+	}{
+		{
+			name:            "exact domain with dns route handler",
+			query:           "example.com.",
+			expectedHandler: dnsRouteHandler,
+		},
+		{
+			name:            "subdomain should use upstream handler",
+			query:           "sub.example.com.",
+			expectedHandler: upstreamHandler,
+		},
+		{
+			name:            "deep subdomain should use upstream handler",
+			query:           "deep.sub.example.com.",
+			expectedHandler: upstreamHandler,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := new(dns.Msg)
+			r.SetQuestion(tc.query, dns.TypeA)
+			w := &ResponseWriterChain{ResponseWriter: &mockResponseWriter{}}
+
+			if mh, ok := tc.expectedHandler.(*MockHandler); ok {
+				mh.On("ServeDNS", mock.Anything, r).Once()
+			} else if mh, ok := tc.expectedHandler.(*MockSubdomainHandler); ok {
+				mh.On("ServeDNS", mock.Anything, r).Once()
+			}
+
+			chain.ServeDNS(w, r)
+
+			if mh, ok := tc.expectedHandler.(*MockHandler); ok {
+				mh.AssertExpectations(t)
+			} else if mh, ok := tc.expectedHandler.(*MockSubdomainHandler); ok {
+				mh.AssertExpectations(t)
+			}
+
+			// Reset mocks
+			if mh, ok := tc.expectedHandler.(*MockHandler); ok {
+				mh.ExpectedCalls = nil
+				mh.Calls = nil
+			} else if mh, ok := tc.expectedHandler.(*MockSubdomainHandler); ok {
+				mh.ExpectedCalls = nil
+				mh.Calls = nil
+			}
+		})
 	}
 }

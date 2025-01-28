@@ -5,7 +5,7 @@ import (
 
 	"github.com/google/gopacket"
 
-	fw "github.com/netbirdio/netbird/client/firewall"
+	firewall "github.com/netbirdio/netbird/client/firewall/manager"
 )
 
 // Rule to handle management of rules
@@ -15,9 +15,8 @@ type Rule struct {
 	ipLayer    gopacket.LayerType
 	matchByIP  bool
 	protoLayer gopacket.LayerType
-	direction  fw.RuleDirection
-	sPort      uint16
-	dPort      uint16
+	sPort      *firewall.Port
+	dPort      *firewall.Port
 	drop       bool
 	comment    string
 

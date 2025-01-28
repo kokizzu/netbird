@@ -1,20 +1,21 @@
 package idp
 
 import (
-	"encoding/base64"
-	"encoding/json"
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
-	"strconv"
+	"slices"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/golang-jwt/jwt"
-	"github.com/netbirdio/netbird/management/server/telemetry"
 	log "github.com/sirupsen/logrus"
+
+	"github.com/netbirdio/netbird/management/server/telemetry"
 )
 
 // ZitadelManager zitadel manager client instance.
@@ -33,6 +34,7 @@ type ZitadelClientConfig struct {
 	GrantType          string
 	TokenEndpoint      string
 	ManagementEndpoint string
+	PAT                string
 }
 
 // ZitadelCredentials zitadel authentication information.
@@ -67,12 +69,6 @@ type zitadelUser struct {
 
 type zitadelAttributes map[string][]map[string]any
 
-// zitadelMetadata holds additional user data.
-type zitadelMetadata struct {
-	Key   string `json:"key"`
-	Value string `json:"value"`
-}
-
 // zitadelProfile represents an zitadel user profile response.
 type zitadelProfile struct {
 	ID                 string       `json:"id"`
@@ -81,7 +77,85 @@ type zitadelProfile struct {
 	PreferredLoginName string       `json:"preferredLoginName"`
 	LoginNames         []string     `json:"loginNames"`
 	Human              *zitadelUser `json:"human"`
-	Metadata           []zitadelMetadata
+}
+
+// zitadelUserDetails represents the metadata for the new user that was created
+type zitadelUserDetails struct {
+	Sequence      string `json:"sequence"`     // uint64 as a string
+	CreationDate  string `json:"creationDate"` // ISO format
+	ChangeDate    string `json:"changeDate"`   // ISO format
+	ResourceOwner string
+}
+
+// zitadelPasswordlessRegistration represents the information for the user to complete signup
+type zitadelPasswordlessRegistration struct {
+	Link       string `json:"link"`
+	Expiration string `json:"expiration"` // ex: 3600s
+}
+
+// zitadelUser represents an zitadel create user response
+type zitadelUserResponse struct {
+	UserId                   string                          `json:"userId"`
+	Details                  zitadelUserDetails              `json:"details"`
+	PasswordlessRegistration zitadelPasswordlessRegistration `json:"passwordlessRegistration"`
+}
+
+// readZitadelError parses errors returned by the zitadel APIs from a response.
+func readZitadelError(body io.ReadCloser) error {
+	bodyBytes, err := io.ReadAll(body)
+	if err != nil {
+		return fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	helper := JsonParser{}
+	var target map[string]interface{}
+	err = helper.Unmarshal(bodyBytes, &target)
+	if err != nil {
+		return fmt.Errorf("error unparsable body: %s", string(bodyBytes))
+	}
+
+	// ensure keys are ordered for consistent logging behaviour.
+	errorKeys := make([]string, 0, len(target))
+	for k := range target {
+		errorKeys = append(errorKeys, k)
+	}
+	slices.Sort(errorKeys)
+
+	var errsOut []string
+	for _, k := range errorKeys {
+		if _, isEmbedded := target[k].(map[string]interface{}); isEmbedded {
+			continue
+		}
+		errsOut = append(errsOut, fmt.Sprintf("%s: %v", k, target[k]))
+	}
+
+	if len(errsOut) == 0 {
+		return errors.New("unknown error")
+	}
+
+	return errors.New(strings.Join(errsOut, " "))
+}
+
+// verifyJWTConfig ensures necessary values are set in the ZitadelClientConfig for JWTs to be generated.
+func verifyJWTConfig(config ZitadelClientConfig) error {
+
+	if config.ClientID == "" {
+		return fmt.Errorf("zitadel IdP configuration is incomplete, clientID is missing")
+	}
+
+	if config.ClientSecret == "" {
+		return fmt.Errorf("zitadel IdP configuration is incomplete, ClientSecret is missing")
+	}
+
+	if config.TokenEndpoint == "" {
+		return fmt.Errorf("zitadel IdP configuration is incomplete, TokenEndpoint is missing")
+	}
+
+	if config.GrantType == "" {
+		return fmt.Errorf("zitadel IdP configuration is incomplete, GrantType is missing")
+	}
+
+	return nil
 }
 
 // NewZitadelManager creates a new instance of the ZitadelManager.
@@ -95,24 +169,16 @@ func NewZitadelManager(config ZitadelClientConfig, appMetrics telemetry.AppMetri
 	}
 	helper := JsonParser{}
 
-	if config.ClientID == "" {
-		return nil, fmt.Errorf("zitadel IdP configuration is incomplete, clientID is missing")
-	}
-
-	if config.ClientSecret == "" {
-		return nil, fmt.Errorf("zitadel IdP configuration is incomplete, ClientSecret is missing")
-	}
-
-	if config.TokenEndpoint == "" {
-		return nil, fmt.Errorf("zitadel IdP configuration is incomplete, TokenEndpoint is missing")
+	hasPAT := config.PAT != ""
+	if !hasPAT {
+		jwtErr := verifyJWTConfig(config)
+		if jwtErr != nil {
+			return nil, jwtErr
+		}
 	}
 
 	if config.ManagementEndpoint == "" {
 		return nil, fmt.Errorf("zitadel IdP configuration is incomplete, ManagementEndpoint is missing")
-	}
-
-	if config.GrantType == "" {
-		return nil, fmt.Errorf("zitadel IdP configuration is incomplete, GrantType is missing")
 	}
 
 	credentials := &ZitadelCredentials{
@@ -137,12 +203,12 @@ func (zc *ZitadelCredentials) jwtStillValid() bool {
 }
 
 // requestJWTToken performs request to get jwt token.
-func (zc *ZitadelCredentials) requestJWTToken() (*http.Response, error) {
+func (zc *ZitadelCredentials) requestJWTToken(ctx context.Context) (*http.Response, error) {
 	data := url.Values{}
 	data.Set("client_id", zc.clientConfig.ClientID)
 	data.Set("client_secret", zc.clientConfig.ClientSecret)
 	data.Set("grant_type", zc.clientConfig.GrantType)
-	data.Set("scope", "urn:zitadel:iam:org:project:id:zitadel:aud")
+	data.Set("scope", "openid urn:zitadel:iam:org:project:id:zitadel:aud")
 
 	payload := strings.NewReader(data.Encode())
 	req, err := http.NewRequest(http.MethodPost, zc.clientConfig.TokenEndpoint, payload)
@@ -151,7 +217,7 @@ func (zc *ZitadelCredentials) requestJWTToken() (*http.Response, error) {
 	}
 	req.Header.Add("content-type", "application/x-www-form-urlencoded")
 
-	log.Debug("requesting new jwt token for zitadel idp manager")
+	log.WithContext(ctx).Debug("requesting new jwt token for zitadel idp manager")
 
 	resp, err := zc.httpClient.Do(req)
 	if err != nil {
@@ -163,7 +229,8 @@ func (zc *ZitadelCredentials) requestJWTToken() (*http.Response, error) {
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("unable to get zitadel token, statusCode %d", resp.StatusCode)
+		zErr := readZitadelError(resp.Body)
+		return nil, fmt.Errorf("unable to get zitadel token, statusCode %d, zitadel: %w", resp.StatusCode, zErr)
 	}
 
 	return resp, nil
@@ -202,8 +269,22 @@ func (zc *ZitadelCredentials) parseRequestJWTResponse(rawBody io.ReadCloser) (JW
 	return jwtToken, nil
 }
 
+// generatePATToken creates a functional JWTToken instance which will pass the
+// PAT to the API directly and skip requesting a token.
+func (zc *ZitadelCredentials) generatePATToken() (JWTToken, error) {
+	tok := JWTToken{
+		AccessToken: zc.clientConfig.PAT,
+		Scope:       "openid",
+		ExpiresIn:   9999,
+		TokenType:   "PAT",
+	}
+	tok.expiresInTime = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second)
+	zc.jwtToken = tok
+	return tok, nil
+}
+
 // Authenticate retrieves access token to use the Zitadel Management API.
-func (zc *ZitadelCredentials) Authenticate() (JWTToken, error) {
+func (zc *ZitadelCredentials) Authenticate(ctx context.Context) (JWTToken, error) {
 	zc.mux.Lock()
 	defer zc.mux.Unlock()
 
@@ -217,7 +298,11 @@ func (zc *ZitadelCredentials) Authenticate() (JWTToken, error) {
 		return zc.jwtToken, nil
 	}
 
-	resp, err := zc.requestJWTToken()
+	if zc.clientConfig.PAT != "" {
+		return zc.generatePATToken()
+	}
+
+	resp, err := zc.requestJWTToken(ctx)
 	if err != nil {
 		return zc.jwtToken, err
 	}
@@ -233,14 +318,31 @@ func (zc *ZitadelCredentials) Authenticate() (JWTToken, error) {
 	return zc.jwtToken, nil
 }
 
-// CreateUser creates a new user in zitadel Idp and sends an invite.
-func (zm *ZitadelManager) CreateUser(email string, name string, accountID string) (*UserData, error) {
-	payload, err := buildZitadelCreateUserRequestPayload(email, name)
+// CreateUser creates a new user in zitadel Idp and sends an invite via Zitadel.
+func (zm *ZitadelManager) CreateUser(ctx context.Context, email, name, accountID, invitedByEmail string) (*UserData, error) {
+	firstLast := strings.SplitN(name, " ", 2)
+
+	var addUser = map[string]any{
+		"userName": email,
+		"profile": map[string]string{
+			"firstName":   firstLast[0],
+			"lastName":    firstLast[0],
+			"displayName": name,
+		},
+		"email": map[string]any{
+			"email":           email,
+			"isEmailVerified": false,
+		},
+		"passwordChangeRequired":          true,
+		"requestPasswordlessRegistration": false, // let Zitadel send the invite for us
+	}
+
+	payload, err := zm.helper.Marshal(addUser)
 	if err != nil {
 		return nil, err
 	}
 
-	body, err := zm.post("users/human/_import", payload)
+	body, err := zm.post(ctx, "users/human/_import", string(payload))
 	if err != nil {
 		return nil, err
 	}
@@ -249,32 +351,29 @@ func (zm *ZitadelManager) CreateUser(email string, name string, accountID string
 		zm.appMetrics.IDPMetrics().CountCreateUser()
 	}
 
-	var result struct {
-		UserID string `json:"userId"`
-	}
-	err = zm.helper.Unmarshal(body, &result)
+	var newUser zitadelUserResponse
+	err = zm.helper.Unmarshal(body, &newUser)
 	if err != nil {
 		return nil, err
 	}
 
-	invite := true
-	appMetadata := AppMetadata{
-		WTAccountID:     accountID,
-		WTPendingInvite: &invite,
+	var pending bool = true
+	ret := &UserData{
+		Email: email,
+		Name:  name,
+		ID:    newUser.UserId,
+		AppMetadata: AppMetadata{
+			WTAccountID:     accountID,
+			WTPendingInvite: &pending,
+			WTInvitedBy:     invitedByEmail,
+		},
 	}
-
-	// Add metadata to new user
-	err = zm.UpdateUserAppMetadata(result.UserID, appMetadata)
-	if err != nil {
-		return nil, err
-	}
-
-	return zm.GetUserDataByID(result.UserID, appMetadata)
+	return ret, nil
 }
 
 // GetUserByEmail searches users with a given email.
 // If no users have been found, this function returns an empty list.
-func (zm *ZitadelManager) GetUserByEmail(email string) ([]*UserData, error) {
+func (zm *ZitadelManager) GetUserByEmail(ctx context.Context, email string) ([]*UserData, error) {
 	searchByEmail := zitadelAttributes{
 		"queries": {
 			{
@@ -290,7 +389,7 @@ func (zm *ZitadelManager) GetUserByEmail(email string) ([]*UserData, error) {
 		return nil, err
 	}
 
-	body, err := zm.post("users/_search", string(payload))
+	body, err := zm.post(ctx, "users/_search", string(payload))
 	if err != nil {
 		return nil, err
 	}
@@ -307,12 +406,6 @@ func (zm *ZitadelManager) GetUserByEmail(email string) ([]*UserData, error) {
 
 	users := make([]*UserData, 0)
 	for _, profile := range profiles.Result {
-		metadata, err := zm.getUserMetadata(profile.ID)
-		if err != nil {
-			return nil, err
-		}
-		profile.Metadata = metadata
-
 		users = append(users, profile.userData())
 	}
 
@@ -320,8 +413,8 @@ func (zm *ZitadelManager) GetUserByEmail(email string) ([]*UserData, error) {
 }
 
 // GetUserDataByID requests user data from zitadel via ID.
-func (zm *ZitadelManager) GetUserDataByID(userID string, appMetadata AppMetadata) (*UserData, error) {
-	body, err := zm.get("users/"+userID, nil)
+func (zm *ZitadelManager) GetUserDataByID(ctx context.Context, userID string, appMetadata AppMetadata) (*UserData, error) {
+	body, err := zm.get(ctx, "users/"+userID, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -336,18 +429,15 @@ func (zm *ZitadelManager) GetUserDataByID(userID string, appMetadata AppMetadata
 		return nil, err
 	}
 
-	metadata, err := zm.getUserMetadata(userID)
-	if err != nil {
-		return nil, err
-	}
-	profile.User.Metadata = metadata
+	userData := profile.User.userData()
+	userData.AppMetadata = appMetadata
 
-	return profile.User.userData(), nil
+	return userData, nil
 }
 
 // GetAccount returns all the users for a given profile.
-func (zm *ZitadelManager) GetAccount(accountID string) ([]*UserData, error) {
-	accounts, err := zm.GetAllAccounts()
+func (zm *ZitadelManager) GetAccount(ctx context.Context, accountID string) ([]*UserData, error) {
+	body, err := zm.post(ctx, "users/_search", "")
 	if err != nil {
 		return nil, err
 	}
@@ -356,13 +446,27 @@ func (zm *ZitadelManager) GetAccount(accountID string) ([]*UserData, error) {
 		zm.appMetrics.IDPMetrics().CountGetAccount()
 	}
 
-	return accounts[accountID], nil
+	var profiles struct{ Result []zitadelProfile }
+	err = zm.helper.Unmarshal(body, &profiles)
+	if err != nil {
+		return nil, err
+	}
+
+	users := make([]*UserData, 0)
+	for _, profile := range profiles.Result {
+		userData := profile.userData()
+		userData.AppMetadata.WTAccountID = accountID
+
+		users = append(users, userData)
+	}
+
+	return users, nil
 }
 
 // GetAllAccounts gets all registered accounts with corresponding user data.
 // It returns a list of users indexed by accountID.
-func (zm *ZitadelManager) GetAllAccounts() (map[string][]*UserData, error) {
-	body, err := zm.post("users/_search", "")
+func (zm *ZitadelManager) GetAllAccounts(ctx context.Context) (map[string][]*UserData, error) {
+	body, err := zm.post(ctx, "users/_search", "")
 	if err != nil {
 		return nil, err
 	}
@@ -379,22 +483,8 @@ func (zm *ZitadelManager) GetAllAccounts() (map[string][]*UserData, error) {
 
 	indexedUsers := make(map[string][]*UserData)
 	for _, profile := range profiles.Result {
-		// fetch user metadata
-		metadata, err := zm.getUserMetadata(profile.ID)
-		if err != nil {
-			return nil, err
-		}
-		profile.Metadata = metadata
-
 		userData := profile.userData()
-		accountID := userData.AppMetadata.WTAccountID
-
-		if accountID != "" {
-			if _, ok := indexedUsers[accountID]; !ok {
-				indexedUsers[accountID] = make([]*UserData, 0)
-			}
-			indexedUsers[accountID] = append(indexedUsers[accountID], userData)
-		}
+		indexedUsers[UnsetAccountID] = append(indexedUsers[UnsetAccountID], userData)
 	}
 
 	return indexedUsers, nil
@@ -402,71 +492,48 @@ func (zm *ZitadelManager) GetAllAccounts() (map[string][]*UserData, error) {
 
 // UpdateUserAppMetadata updates user app metadata based on userID and metadata map.
 // Metadata values are base64 encoded.
-func (zm *ZitadelManager) UpdateUserAppMetadata(userID string, appMetadata AppMetadata) error {
-	if appMetadata.WTPendingInvite == nil {
-		appMetadata.WTPendingInvite = new(bool)
-	}
-	pendingInviteBuf := strconv.AppendBool([]byte{}, *appMetadata.WTPendingInvite)
+func (zm *ZitadelManager) UpdateUserAppMetadata(_ context.Context, _ string, _ AppMetadata) error {
+	return nil
+}
 
-	wtAccountIDValue := base64.StdEncoding.EncodeToString([]byte(appMetadata.WTAccountID))
-	wtPendingInviteValue := base64.StdEncoding.EncodeToString(pendingInviteBuf)
+type inviteUserRequest struct {
+	Email string `json:"email"`
+}
 
-	metadata := zitadelAttributes{
-		"metadata": {
-			{
-				"key":   wtAccountID,
-				"value": wtAccountIDValue,
-			},
-			{
-				"key":   wtPendingInvite,
-				"value": wtPendingInviteValue,
-			},
-		},
+// InviteUserByID resend invitations to users who haven't activated,
+// their accounts prior to the expiration period.
+func (zm *ZitadelManager) InviteUserByID(ctx context.Context, userID string) error {
+	inviteUser := inviteUserRequest{
+		Email: userID,
 	}
-	payload, err := zm.helper.Marshal(metadata)
+
+	payload, err := zm.helper.Marshal(inviteUser)
 	if err != nil {
 		return err
 	}
 
-	resource := fmt.Sprintf("users/%s/metadata/_bulk", userID)
-	_, err = zm.post(resource, string(payload))
-	if err != nil {
+	// don't care about the body in the response
+	_, err = zm.post(ctx, fmt.Sprintf("users/%s/_resend_initialization", userID), string(payload))
+	return err
+}
+
+// DeleteUser from Zitadel
+func (zm *ZitadelManager) DeleteUser(ctx context.Context, userID string) error {
+	resource := fmt.Sprintf("users/%s", userID)
+	if err := zm.delete(ctx, resource); err != nil {
 		return err
 	}
 
 	if zm.appMetrics != nil {
-		zm.appMetrics.IDPMetrics().CountUpdateUserAppMetadata()
+		zm.appMetrics.IDPMetrics().CountDeleteUser()
 	}
 
 	return nil
 }
 
-// InviteUserByID resend invitations to users who haven't activated,
-// their accounts prior to the expiration period.
-func (zm *ZitadelManager) InviteUserByID(_ string) error {
-	return fmt.Errorf("method InviteUserByID not implemented")
-}
-
-// getUserMetadata requests user metadata from zitadel via ID.
-func (zm *ZitadelManager) getUserMetadata(userID string) ([]zitadelMetadata, error) {
-	resource := fmt.Sprintf("users/%s/metadata/_search", userID)
-	body, err := zm.post(resource, "")
-	if err != nil {
-		return nil, err
-	}
-
-	var metadata struct{ Result []zitadelMetadata }
-	err = zm.helper.Unmarshal(body, &metadata)
-	if err != nil {
-		return nil, err
-	}
-
-	return metadata.Result, nil
-}
-
 // post perform Post requests.
-func (zm *ZitadelManager) post(resource string, body string) ([]byte, error) {
-	jwtToken, err := zm.credentials.Authenticate()
+func (zm *ZitadelManager) post(ctx context.Context, resource string, body string) ([]byte, error) {
+	jwtToken, err := zm.credentials.Authenticate(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -494,15 +561,53 @@ func (zm *ZitadelManager) post(resource string, body string) ([]byte, error) {
 			zm.appMetrics.IDPMetrics().CountRequestStatusError()
 		}
 
-		return nil, fmt.Errorf("unable to post %s, statusCode %d", reqURL, resp.StatusCode)
+		zErr := readZitadelError(resp.Body)
+
+		return nil, fmt.Errorf("unable to post %s, statusCode %d, zitadel: %w", reqURL, resp.StatusCode, zErr)
 	}
 
 	return io.ReadAll(resp.Body)
 }
 
+// delete perform Delete requests.
+func (zm *ZitadelManager) delete(ctx context.Context, resource string) error {
+	jwtToken, err := zm.credentials.Authenticate(ctx)
+	if err != nil {
+		return err
+	}
+
+	reqURL := fmt.Sprintf("%s/%s", zm.managementEndpoint, resource)
+	req, err := http.NewRequest(http.MethodDelete, reqURL, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Add("authorization", "Bearer "+jwtToken.AccessToken)
+	req.Header.Add("content-type", "application/json")
+
+	resp, err := zm.httpClient.Do(req)
+	if err != nil {
+		if zm.appMetrics != nil {
+			zm.appMetrics.IDPMetrics().CountRequestError()
+		}
+
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		if zm.appMetrics != nil {
+			zm.appMetrics.IDPMetrics().CountRequestStatusError()
+		}
+
+		return fmt.Errorf("unable to get %s, statusCode %d", reqURL, resp.StatusCode)
+	}
+
+	return nil
+}
+
 // get perform Get requests.
-func (zm *ZitadelManager) get(resource string, q url.Values) ([]byte, error) {
-	jwtToken, err := zm.credentials.Authenticate()
+func (zm *ZitadelManager) get(ctx context.Context, resource string, q url.Values) ([]byte, error) {
+	jwtToken, err := zm.credentials.Authenticate(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -530,93 +635,34 @@ func (zm *ZitadelManager) get(resource string, q url.Values) ([]byte, error) {
 			zm.appMetrics.IDPMetrics().CountRequestStatusError()
 		}
 
-		return nil, fmt.Errorf("unable to get %s, statusCode %d", reqURL, resp.StatusCode)
+		zErr := readZitadelError(resp.Body)
+
+		return nil, fmt.Errorf("unable to get %s, statusCode %d, zitadel: %w", reqURL, resp.StatusCode, zErr)
 	}
 
 	return io.ReadAll(resp.Body)
 }
 
-// value returns string represented by the base64 string value.
-func (zm zitadelMetadata) value() string {
-	value, err := base64.StdEncoding.DecodeString(zm.Value)
-	if err != nil {
-		return ""
-	}
-
-	return string(value)
-}
-
 // userData construct user data from zitadel profile.
 func (zp zitadelProfile) userData() *UserData {
 	var (
-		email                string
-		name                 string
-		wtAccountIDValue     string
-		wtPendingInviteValue bool
+		email string
+		name  string
 	)
-
-	for _, metadata := range zp.Metadata {
-		if metadata.Key == wtAccountID {
-			wtAccountIDValue = metadata.value()
-		}
-
-		if metadata.Key == wtPendingInvite {
-			value, err := strconv.ParseBool(metadata.value())
-			if err == nil {
-				wtPendingInviteValue = value
-			}
-		}
-	}
 
 	// Obtain the email for the human account and the login name,
 	// for the machine account.
 	if zp.Human != nil {
 		email = zp.Human.Email.Email
 		name = zp.Human.Profile.DisplayName
-	} else {
-		if len(zp.LoginNames) > 0 {
-			email = zp.LoginNames[0]
-			name = zp.LoginNames[0]
-		}
+	} else if len(zp.LoginNames) > 0 {
+		email = zp.LoginNames[0]
+		name = zp.LoginNames[0]
 	}
 
 	return &UserData{
 		Email: email,
 		Name:  name,
 		ID:    zp.ID,
-		AppMetadata: AppMetadata{
-			WTAccountID:     wtAccountIDValue,
-			WTPendingInvite: &wtPendingInviteValue,
-		},
 	}
-}
-
-func buildZitadelCreateUserRequestPayload(email string, name string) (string, error) {
-	var firstName, lastName string
-
-	words := strings.Fields(name)
-	if n := len(words); n > 0 {
-		firstName = strings.Join(words[:n-1], " ")
-		lastName = words[n-1]
-	}
-
-	req := &zitadelUser{
-		UserName: name,
-		Profile: zitadelUserInfo{
-			FirstName:   strings.TrimSpace(firstName),
-			LastName:    strings.TrimSpace(lastName),
-			DisplayName: name,
-		},
-		Email: zitadelEmail{
-			Email:           email,
-			IsEmailVerified: false,
-		},
-	}
-
-	str, err := json.Marshal(req)
-	if err != nil {
-		return "", err
-	}
-
-	return string(str), nil
 }

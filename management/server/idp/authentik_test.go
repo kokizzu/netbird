@@ -1,14 +1,17 @@
 package idp
 
 import (
+	"context"
 	"fmt"
-	"github.com/netbirdio/netbird/management/server/telemetry"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 	"io"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/netbirdio/netbird/management/server/telemetry"
 )
 
 func TestNewAuthentikManager(t *testing.T) {
@@ -24,6 +27,7 @@ func TestNewAuthentikManager(t *testing.T) {
 		Username:      "username",
 		Password:      "password",
 		TokenEndpoint: "https://localhost:8080/application/o/token/",
+		Issuer:        "https://localhost:8080/application/o/netbird/",
 		GrantType:     "client_credentials",
 	}
 
@@ -74,7 +78,17 @@ func TestNewAuthentikManager(t *testing.T) {
 		assertErrFuncMessage: "should return error when field empty",
 	}
 
-	for _, testCase := range []test{testCase1, testCase2, testCase3, testCase4, testCase5} {
+	testCase6Config := defaultTestConfig
+	testCase6Config.Issuer = ""
+
+	testCase6 := test{
+		name:                 "Missing Issuer Configuration",
+		inputConfig:          testCase6Config,
+		assertErrFunc:        require.Error,
+		assertErrFuncMessage: "should return error when field empty",
+	}
+
+	for _, testCase := range []test{testCase1, testCase2, testCase3, testCase4, testCase5, testCase6} {
 		t.Run(testCase.name, func(t *testing.T) {
 			_, err := NewAuthentikManager(testCase.inputConfig, &telemetry.MockAppMetrics{})
 			testCase.assertErrFunc(t, err, testCase.assertErrFuncMessage)
@@ -125,7 +139,7 @@ func TestAuthentikRequestJWTToken(t *testing.T) {
 				helper:       testCase.helper,
 			}
 
-			resp, err := creds.requestJWTToken()
+			resp, err := creds.requestJWTToken(context.Background())
 			if err != nil {
 				if testCase.expectedFuncExitErrDiff != nil {
 					assert.EqualError(t, err, testCase.expectedFuncExitErrDiff.Error(), "errors should be the same")
@@ -133,6 +147,7 @@ func TestAuthentikRequestJWTToken(t *testing.T) {
 					t.Fatal(err)
 				}
 			} else {
+				defer resp.Body.Close()
 				body, err := io.ReadAll(resp.Body)
 				assert.NoError(t, err, "unable to read the response body")
 
@@ -290,7 +305,7 @@ func TestAuthentikAuthenticate(t *testing.T) {
 			}
 			creds.jwtToken.expiresInTime = testCase.inputExpireToken
 
-			_, err := creds.Authenticate()
+			_, err := creds.Authenticate(context.Background())
 			if err != nil {
 				if testCase.expectedFuncExitErrDiff != nil {
 					assert.EqualError(t, err, testCase.expectedFuncExitErrDiff.Error(), "errors should be the same")

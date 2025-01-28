@@ -1,15 +1,17 @@
 package idp
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/netbirdio/netbird/management/server/telemetry"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/netbirdio/netbird/management/server/telemetry"
 )
 
 func TestNewZitadelManager(t *testing.T) {
@@ -63,17 +65,7 @@ func TestNewZitadelManager(t *testing.T) {
 	}
 }
 
-type mockZitadelCredentials struct {
-	jwtToken JWTToken
-	err      error
-}
-
-func (mc *mockZitadelCredentials) Authenticate() (JWTToken, error) {
-	return mc.jwtToken, mc.err
-}
-
 func TestZitadelRequestJWTToken(t *testing.T) {
-
 	type requestJWTTokenTest struct {
 		name                    string
 		inputCode               int
@@ -95,15 +87,14 @@ func TestZitadelRequestJWTToken(t *testing.T) {
 	requestJWTTokenTestCase2 := requestJWTTokenTest{
 		name:                    "Request Bad Status Code",
 		inputCode:               400,
-		inputRespBody:           "{}",
+		inputRespBody:           "{\"error\": \"invalid_scope\", \"error_description\":\"openid missing\"}",
 		helper:                  JsonParser{},
-		expectedFuncExitErrDiff: fmt.Errorf("unable to get zitadel token, statusCode 400"),
+		expectedFuncExitErrDiff: fmt.Errorf("unable to get zitadel token, statusCode 400, zitadel: error: invalid_scope error_description: openid missing"),
 		expectedToken:           "",
 	}
 
 	for _, testCase := range []requestJWTTokenTest{requestJWTTokenTesttCase1, requestJWTTokenTestCase2} {
 		t.Run(testCase.name, func(t *testing.T) {
-
 			jwtReqClient := mockHTTPClient{
 				resBody: testCase.inputRespBody,
 				code:    testCase.inputCode,
@@ -116,7 +107,7 @@ func TestZitadelRequestJWTToken(t *testing.T) {
 				helper:       testCase.helper,
 			}
 
-			resp, err := creds.requestJWTToken()
+			resp, err := creds.requestJWTToken(context.Background())
 			if err != nil {
 				if testCase.expectedFuncExitErrDiff != nil {
 					assert.EqualError(t, err, testCase.expectedFuncExitErrDiff.Error(), "errors should be the same")
@@ -124,6 +115,7 @@ func TestZitadelRequestJWTToken(t *testing.T) {
 					t.Fatal(err)
 				}
 			} else {
+				defer resp.Body.Close()
 				body, err := io.ReadAll(resp.Body)
 				assert.NoError(t, err, "unable to read the response body")
 
@@ -162,7 +154,7 @@ func TestZitadelParseRequestJWTResponse(t *testing.T) {
 	}
 	parseRequestJWTResponseTestCase2 := parseRequestJWTResponseTest{
 		name:                 "Parse Bad json JWT Body",
-		inputRespBody:        "",
+		inputRespBody:        "{}",
 		helper:               JsonParser{},
 		expectedToken:        "",
 		expectedExpiresIn:    0,
@@ -260,7 +252,7 @@ func TestZitadelAuthenticate(t *testing.T) {
 		inputCode:               400,
 		inputResBody:            "{}",
 		helper:                  JsonParser{},
-		expectedFuncExitErrDiff: fmt.Errorf("unable to get zitadel token, statusCode 400"),
+		expectedFuncExitErrDiff: fmt.Errorf("unable to get zitadel token, statusCode 400, zitadel: unknown error"),
 		expectedCode:            200,
 		expectedToken:           "",
 	}
@@ -281,7 +273,7 @@ func TestZitadelAuthenticate(t *testing.T) {
 			}
 			creds.jwtToken.expiresInTime = testCase.inputExpireToken
 
-			_, err := creds.Authenticate()
+			_, err := creds.Authenticate(context.Background())
 			if err != nil {
 				if testCase.expectedFuncExitErrDiff != nil {
 					assert.EqualError(t, err, testCase.expectedFuncExitErrDiff.Error(), "errors should be the same")
@@ -291,98 +283,6 @@ func TestZitadelAuthenticate(t *testing.T) {
 			}
 
 			assert.Equalf(t, testCase.expectedToken, creds.jwtToken.AccessToken, "two tokens should be the same")
-		})
-	}
-}
-
-func TestZitadelUpdateUserAppMetadata(t *testing.T) {
-	type updateUserAppMetadataTest struct {
-		name                 string
-		inputReqBody         string
-		expectedReqBody      string
-		appMetadata          AppMetadata
-		statusCode           int
-		helper               ManagerHelper
-		managerCreds         ManagerCredentials
-		assertErrFunc        assert.ErrorAssertionFunc
-		assertErrFuncMessage string
-	}
-
-	appMetadata := AppMetadata{WTAccountID: "ok"}
-
-	updateUserAppMetadataTestCase1 := updateUserAppMetadataTest{
-		name:            "Bad Authentication",
-		expectedReqBody: "",
-		appMetadata:     appMetadata,
-		statusCode:      400,
-		helper:          JsonParser{},
-		managerCreds: &mockZitadelCredentials{
-			jwtToken: JWTToken{},
-			err:      fmt.Errorf("error"),
-		},
-		assertErrFunc:        assert.Error,
-		assertErrFuncMessage: "should return error",
-	}
-
-	updateUserAppMetadataTestCase2 := updateUserAppMetadataTest{
-		name:       "Bad Response Parsing",
-		statusCode: 400,
-		helper:     &mockJsonParser{marshalErrorString: "error"},
-		managerCreds: &mockZitadelCredentials{
-			jwtToken: JWTToken{},
-		},
-		assertErrFunc:        assert.Error,
-		assertErrFuncMessage: "should return error",
-	}
-
-	updateUserAppMetadataTestCase3 := updateUserAppMetadataTest{
-		name:            "Good request",
-		expectedReqBody: "{\"metadata\":[{\"key\":\"wt_account_id\",\"value\":\"b2s=\"},{\"key\":\"wt_pending_invite\",\"value\":\"ZmFsc2U=\"}]}",
-		appMetadata:     appMetadata,
-		statusCode:      200,
-		helper:          JsonParser{},
-		managerCreds: &mockZitadelCredentials{
-			jwtToken: JWTToken{},
-		},
-		assertErrFunc:        assert.NoError,
-		assertErrFuncMessage: "shouldn't return error",
-	}
-
-	invite := true
-	updateUserAppMetadataTestCase4 := updateUserAppMetadataTest{
-		name:            "Update Pending Invite",
-		expectedReqBody: "{\"metadata\":[{\"key\":\"wt_account_id\",\"value\":\"b2s=\"},{\"key\":\"wt_pending_invite\",\"value\":\"dHJ1ZQ==\"}]}",
-		appMetadata: AppMetadata{
-			WTAccountID:     "ok",
-			WTPendingInvite: &invite,
-		},
-		statusCode: 200,
-		helper:     JsonParser{},
-		managerCreds: &mockZitadelCredentials{
-			jwtToken: JWTToken{},
-		},
-		assertErrFunc:        assert.NoError,
-		assertErrFuncMessage: "shouldn't return error",
-	}
-
-	for _, testCase := range []updateUserAppMetadataTest{updateUserAppMetadataTestCase1, updateUserAppMetadataTestCase2,
-		updateUserAppMetadataTestCase3, updateUserAppMetadataTestCase4} {
-		t.Run(testCase.name, func(t *testing.T) {
-			reqClient := mockHTTPClient{
-				resBody: testCase.inputReqBody,
-				code:    testCase.statusCode,
-			}
-
-			manager := &ZitadelManager{
-				httpClient:  &reqClient,
-				credentials: testCase.managerCreds,
-				helper:      testCase.helper,
-			}
-
-			err := manager.UpdateUserAppMetadata("1", testCase.appMetadata)
-			testCase.assertErrFunc(t, err, testCase.assertErrFuncMessage)
-
-			assert.Equal(t, testCase.expectedReqBody, reqClient.reqBody, "request body should match")
 		})
 	}
 }
@@ -417,16 +317,6 @@ func TestZitadelProfile(t *testing.T) {
 					IsEmailVerified: true,
 				},
 			},
-			Metadata: []zitadelMetadata{
-				{
-					Key:   "wt_account_id",
-					Value: "MQ==",
-				},
-				{
-					Key:   "wt_pending_invite",
-					Value: "ZmFsc2U=",
-				},
-			},
 		},
 		expectedUserData: UserData{
 			ID:    "test1",
@@ -450,16 +340,6 @@ func TestZitadelProfile(t *testing.T) {
 				"machine",
 			},
 			Human: nil,
-			Metadata: []zitadelMetadata{
-				{
-					Key:   "wt_account_id",
-					Value: "MQ==",
-				},
-				{
-					Key:   "wt_pending_invite",
-					Value: "dHJ1ZQ==",
-				},
-			},
 		},
 		expectedUserData: UserData{
 			ID:    "test2",
@@ -479,8 +359,6 @@ func TestZitadelProfile(t *testing.T) {
 			assert.Equal(t, testCase.expectedUserData.ID, userData.ID, "User id should match")
 			assert.Equal(t, testCase.expectedUserData.Email, userData.Email, "User email should match")
 			assert.Equal(t, testCase.expectedUserData.Name, userData.Name, "User name should match")
-			assert.Equal(t, testCase.expectedUserData.AppMetadata.WTAccountID, userData.AppMetadata.WTAccountID, "Account id should match")
-			assert.Equal(t, testCase.expectedUserData.AppMetadata.WTPendingInvite, userData.AppMetadata.WTPendingInvite, "Pending invite should match")
 		})
 	}
 }

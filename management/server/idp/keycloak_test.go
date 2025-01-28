@@ -1,6 +1,7 @@
 package idp
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"strings"
@@ -84,15 +85,6 @@ func TestNewKeycloakManager(t *testing.T) {
 	}
 }
 
-type mockKeycloakCredentials struct {
-	jwtToken JWTToken
-	err      error
-}
-
-func (mc *mockKeycloakCredentials) Authenticate() (JWTToken, error) {
-	return mc.jwtToken, mc.err
-}
-
 func TestKeycloakRequestJWTToken(t *testing.T) {
 
 	type requestJWTTokenTest struct {
@@ -137,7 +129,7 @@ func TestKeycloakRequestJWTToken(t *testing.T) {
 				helper:       testCase.helper,
 			}
 
-			resp, err := creds.requestJWTToken()
+			resp, err := creds.requestJWTToken(context.Background())
 			if err != nil {
 				if testCase.expectedFuncExitErrDiff != nil {
 					assert.EqualError(t, err, testCase.expectedFuncExitErrDiff.Error(), "errors should be the same")
@@ -145,6 +137,7 @@ func TestKeycloakRequestJWTToken(t *testing.T) {
 					t.Fatal(err)
 				}
 			} else {
+				defer resp.Body.Close()
 				body, err := io.ReadAll(resp.Body)
 				assert.NoError(t, err, "unable to read the response body")
 
@@ -302,7 +295,7 @@ func TestKeycloakAuthenticate(t *testing.T) {
 			}
 			creds.jwtToken.expiresInTime = testCase.inputExpireToken
 
-			_, err := creds.Authenticate()
+			_, err := creds.Authenticate(context.Background())
 			if err != nil {
 				if testCase.expectedFuncExitErrDiff != nil {
 					assert.EqualError(t, err, testCase.expectedFuncExitErrDiff.Error(), "errors should be the same")
@@ -312,111 +305,6 @@ func TestKeycloakAuthenticate(t *testing.T) {
 			}
 
 			assert.Equalf(t, testCase.expectedToken, creds.jwtToken.AccessToken, "two tokens should be the same")
-		})
-	}
-}
-
-func TestKeycloakUpdateUserAppMetadata(t *testing.T) {
-	type updateUserAppMetadataTest struct {
-		name                 string
-		inputReqBody         string
-		expectedReqBody      string
-		appMetadata          AppMetadata
-		statusCode           int
-		helper               ManagerHelper
-		managerCreds         ManagerCredentials
-		assertErrFunc        assert.ErrorAssertionFunc
-		assertErrFuncMessage string
-	}
-
-	appMetadata := AppMetadata{WTAccountID: "ok"}
-
-	updateUserAppMetadataTestCase1 := updateUserAppMetadataTest{
-		name:            "Bad Authentication",
-		expectedReqBody: "",
-		appMetadata:     appMetadata,
-		statusCode:      400,
-		helper:          JsonParser{},
-		managerCreds: &mockKeycloakCredentials{
-			jwtToken: JWTToken{},
-			err:      fmt.Errorf("error"),
-		},
-		assertErrFunc:        assert.Error,
-		assertErrFuncMessage: "should return error",
-	}
-
-	updateUserAppMetadataTestCase2 := updateUserAppMetadataTest{
-		name:            "Bad Status Code",
-		expectedReqBody: fmt.Sprintf("{\"attributes\":{\"wt_account_id\":[\"%s\"],\"wt_pending_invite\":[\"false\"]}}", appMetadata.WTAccountID),
-		appMetadata:     appMetadata,
-		statusCode:      400,
-		helper:          JsonParser{},
-		managerCreds: &mockKeycloakCredentials{
-			jwtToken: JWTToken{},
-		},
-		assertErrFunc:        assert.Error,
-		assertErrFuncMessage: "should return error",
-	}
-
-	updateUserAppMetadataTestCase3 := updateUserAppMetadataTest{
-		name:       "Bad Response Parsing",
-		statusCode: 400,
-		helper:     &mockJsonParser{marshalErrorString: "error"},
-		managerCreds: &mockKeycloakCredentials{
-			jwtToken: JWTToken{},
-		},
-		assertErrFunc:        assert.Error,
-		assertErrFuncMessage: "should return error",
-	}
-
-	updateUserAppMetadataTestCase4 := updateUserAppMetadataTest{
-		name:            "Good request",
-		expectedReqBody: fmt.Sprintf("{\"attributes\":{\"wt_account_id\":[\"%s\"],\"wt_pending_invite\":[\"false\"]}}", appMetadata.WTAccountID),
-		appMetadata:     appMetadata,
-		statusCode:      204,
-		helper:          JsonParser{},
-		managerCreds: &mockKeycloakCredentials{
-			jwtToken: JWTToken{},
-		},
-		assertErrFunc:        assert.NoError,
-		assertErrFuncMessage: "shouldn't return error",
-	}
-
-	invite := true
-	updateUserAppMetadataTestCase5 := updateUserAppMetadataTest{
-		name:            "Update Pending Invite",
-		expectedReqBody: fmt.Sprintf("{\"attributes\":{\"wt_account_id\":[\"%s\"],\"wt_pending_invite\":[\"true\"]}}", appMetadata.WTAccountID),
-		appMetadata: AppMetadata{
-			WTAccountID:     "ok",
-			WTPendingInvite: &invite,
-		},
-		statusCode: 204,
-		helper:     JsonParser{},
-		managerCreds: &mockKeycloakCredentials{
-			jwtToken: JWTToken{},
-		},
-		assertErrFunc:        assert.NoError,
-		assertErrFuncMessage: "shouldn't return error",
-	}
-
-	for _, testCase := range []updateUserAppMetadataTest{updateUserAppMetadataTestCase1, updateUserAppMetadataTestCase2,
-		updateUserAppMetadataTestCase3, updateUserAppMetadataTestCase4, updateUserAppMetadataTestCase5} {
-		t.Run(testCase.name, func(t *testing.T) {
-			reqClient := mockHTTPClient{
-				resBody: testCase.inputReqBody,
-				code:    testCase.statusCode,
-			}
-
-			manager := &KeycloakManager{
-				httpClient:  &reqClient,
-				credentials: testCase.managerCreds,
-				helper:      testCase.helper,
-			}
-
-			err := manager.UpdateUserAppMetadata("1", testCase.appMetadata)
-			testCase.assertErrFunc(t, err, testCase.assertErrFuncMessage)
-
-			assert.Equal(t, testCase.expectedReqBody, reqClient.reqBody, "request body should match")
 		})
 	}
 }

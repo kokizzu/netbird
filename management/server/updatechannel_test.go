@@ -1,19 +1,21 @@
 package server
 
 import (
-	"github.com/netbirdio/netbird/management/proto"
+	"context"
 	"testing"
 	"time"
+
+	"github.com/netbirdio/netbird/management/proto"
 )
 
-//var peersUpdater *PeersUpdateManager
+// var peersUpdater *PeersUpdateManager
 
 func TestCreateChannel(t *testing.T) {
 	peer := "test-create"
-	peersUpdater := NewPeersUpdateManager()
-	defer peersUpdater.CloseChannel(peer)
+	peersUpdater := NewPeersUpdateManager(nil)
+	defer peersUpdater.CloseChannel(context.Background(), peer)
 
-	_ = peersUpdater.CreateChannel(peer)
+	_ = peersUpdater.CreateChannel(context.Background(), peer)
 	if _, ok := peersUpdater.peerChannels[peer]; !ok {
 		t.Error("Error creating the channel")
 	}
@@ -21,20 +23,17 @@ func TestCreateChannel(t *testing.T) {
 
 func TestSendUpdate(t *testing.T) {
 	peer := "test-sendupdate"
-	peersUpdater := NewPeersUpdateManager()
+	peersUpdater := NewPeersUpdateManager(nil)
 	update1 := &UpdateMessage{Update: &proto.SyncResponse{
 		NetworkMap: &proto.NetworkMap{
 			Serial: 0,
 		},
 	}}
-	_ = peersUpdater.CreateChannel(peer)
+	_ = peersUpdater.CreateChannel(context.Background(), peer)
 	if _, ok := peersUpdater.peerChannels[peer]; !ok {
 		t.Error("Error creating the channel")
 	}
-	err := peersUpdater.SendUpdate(peer, update1)
-	if err != nil {
-		t.Error("Error sending update: ", err)
-	}
+	peersUpdater.SendUpdate(context.Background(), peer, update1)
 	select {
 	case <-peersUpdater.peerChannels[peer]:
 	default:
@@ -42,10 +41,7 @@ func TestSendUpdate(t *testing.T) {
 	}
 
 	for range [channelBufferSize]int{} {
-		err = peersUpdater.SendUpdate(peer, update1)
-		if err != nil {
-			t.Errorf("got an early error sending update: %v ", err)
-		}
+		peersUpdater.SendUpdate(context.Background(), peer, update1)
 	}
 
 	update2 := &UpdateMessage{Update: &proto.SyncResponse{
@@ -54,10 +50,7 @@ func TestSendUpdate(t *testing.T) {
 		},
 	}}
 
-	err = peersUpdater.SendUpdate(peer, update2)
-	if err != nil {
-		t.Error("update shouldn't return an error when channel buffer is full")
-	}
+	peersUpdater.SendUpdate(context.Background(), peer, update2)
 	timeout := time.After(5 * time.Second)
 	for range [channelBufferSize]int{} {
 		select {
@@ -74,12 +67,12 @@ func TestSendUpdate(t *testing.T) {
 
 func TestCloseChannel(t *testing.T) {
 	peer := "test-close"
-	peersUpdater := NewPeersUpdateManager()
-	_ = peersUpdater.CreateChannel(peer)
+	peersUpdater := NewPeersUpdateManager(nil)
+	_ = peersUpdater.CreateChannel(context.Background(), peer)
 	if _, ok := peersUpdater.peerChannels[peer]; !ok {
 		t.Error("Error creating the channel")
 	}
-	peersUpdater.CloseChannel(peer)
+	peersUpdater.CloseChannel(context.Background(), peer)
 	if _, ok := peersUpdater.peerChannels[peer]; ok {
 		t.Error("Error closing the channel")
 	}

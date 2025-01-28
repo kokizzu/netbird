@@ -3,13 +3,15 @@ package auth
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"github.com/netbirdio/netbird/client/internal"
 	"io"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/netbirdio/netbird/client/internal"
 )
 
 // HostedGrantType grant type for device flow on Hosted
@@ -174,12 +176,12 @@ func (d *DeviceAuthorizationFlow) WaitToken(ctx context.Context, info AuthFlowIn
 				if tokenResponse.Error == "authorization_pending" {
 					continue
 				} else if tokenResponse.Error == "slow_down" {
-					interval = interval + (3 * time.Second)
+					interval += (3 * time.Second)
 					ticker.Reset(interval)
 					continue
 				}
 
-				return TokenInfo{}, fmt.Errorf(tokenResponse.ErrorDescription)
+				return TokenInfo{}, errors.New(tokenResponse.ErrorDescription)
 			}
 
 			tokenInfo := TokenInfo{

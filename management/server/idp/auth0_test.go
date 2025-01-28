@@ -1,7 +1,9 @@
 package idp
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -43,14 +45,14 @@ type mockJsonParser struct {
 
 func (m *mockJsonParser) Marshal(v interface{}) ([]byte, error) {
 	if m.marshalErrorString != "" {
-		return nil, fmt.Errorf(m.marshalErrorString)
+		return nil, errors.New(m.marshalErrorString)
 	}
 	return m.jsonParser.Marshal(v)
 }
 
 func (m *mockJsonParser) Unmarshal(data []byte, v interface{}) error {
 	if m.unmarshalErrorString != "" {
-		return fmt.Errorf(m.unmarshalErrorString)
+		return errors.New(m.unmarshalErrorString)
 	}
 	return m.jsonParser.Unmarshal(data, v)
 }
@@ -60,11 +62,12 @@ type mockAuth0Credentials struct {
 	err      error
 }
 
-func (mc *mockAuth0Credentials) Authenticate() (JWTToken, error) {
+func (mc *mockAuth0Credentials) Authenticate(_ context.Context) (JWTToken, error) {
 	return mc.jwtToken, mc.err
 }
 
 func newTestJWT(t *testing.T, expInt int) string {
+	t.Helper()
 	now := time.Now()
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
 		"iat": now.Unix(),
@@ -125,7 +128,7 @@ func TestAuth0_RequestJWTToken(t *testing.T) {
 				helper:       testCase.helper,
 			}
 
-			res, err := creds.requestJWTToken()
+			res, err := creds.requestJWTToken(context.Background())
 			if err != nil {
 				if testCase.expectedFuncExitErrDiff != nil {
 					assert.EqualError(t, err, testCase.expectedFuncExitErrDiff.Error(), "errors should be the same")
@@ -133,6 +136,7 @@ func TestAuth0_RequestJWTToken(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
+			defer res.Body.Close()
 			body, err := io.ReadAll(res.Body)
 			assert.NoError(t, err, "unable to read the response body")
 
@@ -293,7 +297,7 @@ func TestAuth0_Authenticate(t *testing.T) {
 
 			creds.jwtToken.expiresInTime = testCase.inputExpireToken
 
-			_, err := creds.Authenticate()
+			_, err := creds.Authenticate(context.Background())
 			if err != nil {
 				if testCase.expectedFuncExitErrDiff != nil {
 					assert.EqualError(t, err, testCase.expectedFuncExitErrDiff.Error(), "errors should be the same")
@@ -343,7 +347,7 @@ func TestAuth0_UpdateUserAppMetadata(t *testing.T) {
 	updateUserAppMetadataTestCase2 := updateUserAppMetadataTest{
 		name:            "Bad Status Code",
 		inputReqBody:    fmt.Sprintf("{\"access_token\":\"%s\",\"scope\":\"read:users\",\"expires_in\":%d,\"token_type\":\"Bearer\"}", token, exp),
-		expectedReqBody: fmt.Sprintf("{\"app_metadata\":{\"wt_account_id\":\"%s\",\"wt_pending_invite\":null}}", appMetadata.WTAccountID),
+		expectedReqBody: fmt.Sprintf("{\"app_metadata\":{\"wt_account_id\":\"%s\"}}", appMetadata.WTAccountID),
 		appMetadata:     appMetadata,
 		statusCode:      400,
 		helper:          JsonParser{},
@@ -366,7 +370,7 @@ func TestAuth0_UpdateUserAppMetadata(t *testing.T) {
 	updateUserAppMetadataTestCase4 := updateUserAppMetadataTest{
 		name:                 "Good request",
 		inputReqBody:         fmt.Sprintf("{\"access_token\":\"%s\",\"scope\":\"read:users\",\"expires_in\":%d,\"token_type\":\"Bearer\"}", token, exp),
-		expectedReqBody:      fmt.Sprintf("{\"app_metadata\":{\"wt_account_id\":\"%s\",\"wt_pending_invite\":null}}", appMetadata.WTAccountID),
+		expectedReqBody:      fmt.Sprintf("{\"app_metadata\":{\"wt_account_id\":\"%s\"}}", appMetadata.WTAccountID),
 		appMetadata:          appMetadata,
 		statusCode:           200,
 		helper:               JsonParser{},
@@ -415,7 +419,7 @@ func TestAuth0_UpdateUserAppMetadata(t *testing.T) {
 				helper:      testCase.helper,
 			}
 
-			err := manager.UpdateUserAppMetadata("1", testCase.appMetadata)
+			err := manager.UpdateUserAppMetadata(context.Background(), "1", testCase.appMetadata)
 			testCase.assertErrFunc(t, err, testCase.assertErrFuncMessage)
 
 			assert.Equal(t, testCase.expectedReqBody, jwtReqClient.reqBody, "request body should match")

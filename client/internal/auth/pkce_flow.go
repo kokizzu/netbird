@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
+	"crypto/tls"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"html/template"
 	"net"
@@ -78,7 +80,7 @@ func (p *PKCEAuthorizationFlow) GetClientID(_ context.Context) string {
 }
 
 // RequestAuthInfo requests a authorization code login flow information.
-func (p *PKCEAuthorizationFlow) RequestAuthInfo(_ context.Context) (AuthFlowInfo, error) {
+func (p *PKCEAuthorizationFlow) RequestAuthInfo(ctx context.Context) (AuthFlowInfo, error) {
 	state, err := randomBytesInHex(24)
 	if err != nil {
 		return AuthFlowInfo{}, fmt.Errorf("could not generate random state: %v", err)
@@ -112,60 +114,49 @@ func (p *PKCEAuthorizationFlow) WaitToken(ctx context.Context, _ AuthFlowInfo) (
 	tokenChan := make(chan *oauth2.Token, 1)
 	errChan := make(chan error, 1)
 
-	go p.startServer(tokenChan, errChan)
+	parsedURL, err := url.Parse(p.oAuthConfig.RedirectURL)
+	if err != nil {
+		return TokenInfo{}, fmt.Errorf("failed to parse redirect URL: %v", err)
+	}
+
+	server := &http.Server{Addr: fmt.Sprintf(":%s", parsedURL.Port())}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			log.Errorf("failed to close the server: %v", err)
+		}
+	}()
+
+	go p.startServer(server, tokenChan, errChan)
 
 	select {
 	case <-ctx.Done():
 		return TokenInfo{}, ctx.Err()
 	case token := <-tokenChan:
-		return p.handleOAuthToken(token)
+		return p.parseOAuthToken(token)
 	case err := <-errChan:
 		return TokenInfo{}, err
 	}
 }
 
-func (p *PKCEAuthorizationFlow) startServer(tokenChan chan<- *oauth2.Token, errChan chan<- error) {
-	parsedURL, err := url.Parse(p.oAuthConfig.RedirectURL)
-	if err != nil {
-		errChan <- fmt.Errorf("failed to parse redirect URL: %v", err)
-		return
-	}
-	port := parsedURL.Port()
-
-	server := http.Server{Addr: fmt.Sprintf(":%s", port)}
-	defer func() {
-		if err := server.Shutdown(context.Background()); err != nil {
-			log.Errorf("error while shutting down pkce flow server: %v", err)
-		}
-	}()
-
-	http.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) {
-		tokenValidatorFunc := func() (*oauth2.Token, error) {
-			query := req.URL.Query()
-
-			if authError := query.Get(queryError); authError != "" {
-				authErrorDesc := query.Get(queryErrorDesc)
-				return nil, fmt.Errorf("%s.%s", authError, authErrorDesc)
+func (p *PKCEAuthorizationFlow) startServer(server *http.Server, tokenChan chan<- *oauth2.Token, errChan chan<- error) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) {
+		cert := p.providerConfig.ClientCertPair
+		if cert != nil {
+			tr := &http.Transport{
+				TLSClientConfig: &tls.Config{
+					Certificates: []tls.Certificate{*cert},
+				},
 			}
-
-			// Prevent timing attacks on state
-			if state := query.Get(queryState); subtle.ConstantTimeCompare([]byte(p.state), []byte(state)) == 0 {
-				return nil, fmt.Errorf("invalid state")
-			}
-
-			code := query.Get(queryCode)
-			if code == "" {
-				return nil, fmt.Errorf("missing code")
-			}
-
-			return p.oAuthConfig.Exchange(
-				req.Context(),
-				code,
-				oauth2.SetAuthURLParam("code_verifier", p.codeVerifier),
-			)
+			sslClient := &http.Client{Transport: tr}
+			ctx := context.WithValue(req.Context(), oauth2.HTTPClient, sslClient)
+			req = req.WithContext(ctx)
 		}
 
-		token, err := tokenValidatorFunc()
+		token, err := p.handleRequest(req)
 		if err != nil {
 			renderPKCEFlowTmpl(w, err)
 			errChan <- fmt.Errorf("PKCE authorization flow failed: %v", err)
@@ -176,12 +167,38 @@ func (p *PKCEAuthorizationFlow) startServer(tokenChan chan<- *oauth2.Token, errC
 		tokenChan <- token
 	})
 
-	if err := server.ListenAndServe(); err != nil {
+	server.Handler = mux
+	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		errChan <- err
 	}
 }
 
-func (p *PKCEAuthorizationFlow) handleOAuthToken(token *oauth2.Token) (TokenInfo, error) {
+func (p *PKCEAuthorizationFlow) handleRequest(req *http.Request) (*oauth2.Token, error) {
+	query := req.URL.Query()
+
+	if authError := query.Get(queryError); authError != "" {
+		authErrorDesc := query.Get(queryErrorDesc)
+		return nil, fmt.Errorf("%s.%s", authError, authErrorDesc)
+	}
+
+	// Prevent timing attacks on the state
+	if state := query.Get(queryState); subtle.ConstantTimeCompare([]byte(p.state), []byte(state)) == 0 {
+		return nil, fmt.Errorf("invalid state")
+	}
+
+	code := query.Get(queryCode)
+	if code == "" {
+		return nil, fmt.Errorf("missing code")
+	}
+
+	return p.oAuthConfig.Exchange(
+		req.Context(),
+		code,
+		oauth2.SetAuthURLParam("code_verifier", p.codeVerifier),
+	)
+}
+
+func (p *PKCEAuthorizationFlow) parseOAuthToken(token *oauth2.Token) (TokenInfo, error) {
 	tokenInfo := TokenInfo{
 		AccessToken:  token.AccessToken,
 		RefreshToken: token.RefreshToken,
@@ -193,7 +210,13 @@ func (p *PKCEAuthorizationFlow) handleOAuthToken(token *oauth2.Token) (TokenInfo
 		tokenInfo.IDToken = idToken
 	}
 
-	if err := isValidAccessToken(tokenInfo.GetTokenToUse(), p.providerConfig.Audience); err != nil {
+	// if a provider doesn't support an audience, use the Client ID for token verification
+	audience := p.providerConfig.Audience
+	if audience == "" {
+		audience = p.providerConfig.ClientID
+	}
+
+	if err := isValidAccessToken(tokenInfo.GetTokenToUse(), audience); err != nil {
 		return TokenInfo{}, fmt.Errorf("validate access token failed with error: %v", err)
 	}
 

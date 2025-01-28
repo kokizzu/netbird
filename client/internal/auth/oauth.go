@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"runtime"
 
 	log "github.com/sirupsen/logrus"
 	"google.golang.org/grpc/codes"
@@ -25,7 +26,7 @@ type HTTPClient interface {
 }
 
 // AuthFlowInfo holds information for the OAuth 2.0  authorization flow
-type AuthFlowInfo struct {
+type AuthFlowInfo struct { //nolint:revive
 	DeviceCode              string `json:"device_code"`
 	UserCode                string `json:"user_code"`
 	VerificationURI         string `json:"verification_uri"`
@@ -57,34 +58,57 @@ func (t TokenInfo) GetTokenToUse() string {
 	return t.AccessToken
 }
 
-// NewOAuthFlow initializes and returns the appropriate OAuth flow based on the management configuration.
-func NewOAuthFlow(ctx context.Context, config *internal.Config) (OAuthFlow, error) {
-	log.Debug("getting device authorization flow info")
-
-	// Try to initialize the Device Authorization Flow
-	deviceFlowInfo, err := internal.GetDeviceAuthorizationFlowInfo(ctx, config.PrivateKey, config.ManagementURL)
-	if err == nil {
-		return NewDeviceAuthorizationFlow(deviceFlowInfo.ProviderConfig)
+// NewOAuthFlow initializes and returns the appropriate OAuth flow based on the management configuration
+//
+// It starts by initializing the PKCE.If this process fails, it resorts to the Device Code Flow,
+// and if that also fails, the authentication process is deemed unsuccessful
+//
+// On Linux distros without desktop environment support, it only tries to initialize the Device Code Flow
+func NewOAuthFlow(ctx context.Context, config *internal.Config, isLinuxDesktopClient bool) (OAuthFlow, error) {
+	if runtime.GOOS == "linux" && !isLinuxDesktopClient {
+		return authenticateWithDeviceCodeFlow(ctx, config)
 	}
 
-	log.Debugf("getting device authorization flow info failed with error: %v", err)
-	log.Debugf("falling back to pkce authorization flow info")
+	// On FreeBSD we currently do not support desktop environments and offer only Device Code Flow (#2384)
+	if runtime.GOOS == "freebsd" {
+		return authenticateWithDeviceCodeFlow(ctx, config)
+	}
 
-	// If Device Authorization Flow failed, try the PKCE Authorization Flow
-	pkceFlowInfo, err := internal.GetPKCEAuthorizationFlowInfo(ctx, config.PrivateKey, config.ManagementURL)
+	pkceFlow, err := authenticateWithPKCEFlow(ctx, config)
 	if err != nil {
-		s, ok := gstatus.FromError(err)
-		if ok && s.Code() == codes.NotFound {
+		// fallback to device code flow
+		log.Debugf("failed to initialize pkce authentication with error: %v\n", err)
+		log.Debug("falling back to device code flow")
+		return authenticateWithDeviceCodeFlow(ctx, config)
+	}
+	return pkceFlow, nil
+}
+
+// authenticateWithPKCEFlow initializes the Proof Key for Code Exchange flow auth flow
+func authenticateWithPKCEFlow(ctx context.Context, config *internal.Config) (OAuthFlow, error) {
+	pkceFlowInfo, err := internal.GetPKCEAuthorizationFlowInfo(ctx, config.PrivateKey, config.ManagementURL, config.ClientCertKeyPair)
+	if err != nil {
+		return nil, fmt.Errorf("getting pkce authorization flow info failed with error: %v", err)
+	}
+	return NewPKCEAuthorizationFlow(pkceFlowInfo.ProviderConfig)
+}
+
+// authenticateWithDeviceCodeFlow initializes the Device Code auth Flow
+func authenticateWithDeviceCodeFlow(ctx context.Context, config *internal.Config) (OAuthFlow, error) {
+	deviceFlowInfo, err := internal.GetDeviceAuthorizationFlowInfo(ctx, config.PrivateKey, config.ManagementURL)
+	if err != nil {
+		switch s, ok := gstatus.FromError(err); {
+		case ok && s.Code() == codes.NotFound:
 			return nil, fmt.Errorf("no SSO provider returned from management. " +
-				"If you are using hosting Netbird see documentation at " +
-				"https://github.com/netbirdio/netbird/tree/main/management for details")
-		} else if ok && s.Code() == codes.Unimplemented {
+				"Please proceed with setting up this device using setup keys " +
+				"https://docs.netbird.io/how-to/register-machines-using-setup-keys")
+		case ok && s.Code() == codes.Unimplemented:
 			return nil, fmt.Errorf("the management server, %s, does not support SSO providers, "+
 				"please update your server or use Setup Keys to login", config.ManagementURL)
-		} else {
-			return nil, fmt.Errorf("getting pkce authorization flow info failed with error: %v", err)
+		default:
+			return nil, fmt.Errorf("getting device authorization flow info failed with error: %v", err)
 		}
 	}
 
-	return NewPKCEAuthorizationFlow(pkceFlowInfo.ProviderConfig)
+	return NewDeviceAuthorizationFlow(deviceFlowInfo.ProviderConfig)
 }

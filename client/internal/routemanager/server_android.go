@@ -1,21 +1,27 @@
+//go:build android
+
 package routemanager
 
 import (
 	"context"
+	"fmt"
 
-	"github.com/netbirdio/netbird/iface"
+	firewall "github.com/netbirdio/netbird/client/firewall/manager"
+	"github.com/netbirdio/netbird/client/iface"
+	"github.com/netbirdio/netbird/client/internal/peer"
 	"github.com/netbirdio/netbird/route"
 )
 
 type serverRouter struct {
 }
 
-func newServerRouter(ctx context.Context, wgInterface *iface.WGIface) *serverRouter {
-	return &serverRouter{}
+func (r serverRouter) cleanUp() {
 }
 
-func (r *serverRouter) updateRoutes(routesMap map[string]*route.Route) error {
+func (r serverRouter) updateRoutes(map[route.ID]*route.Route) error {
 	return nil
 }
 
-func (r *serverRouter) cleanUp() {}
+func newServerRouter(context.Context, iface.IWGIface, firewall.Manager, *peer.Status) (*serverRouter, error) {
+	return nil, fmt.Errorf("server route not supported on this os")
+}

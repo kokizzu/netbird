@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -11,8 +12,9 @@ import (
 
 func generateAndStoreEvents(t *testing.T, manager *DefaultAccountManager, typ activity.Activity, initiatorID, targetID,
 	accountID string, count int) {
+	t.Helper()
 	for i := 0; i < count; i++ {
-		_, err := manager.eventStore.Save(&activity.Event{
+		_, err := manager.eventStore.Save(context.Background(), &activity.Event{
 			Timestamp:   time.Now().UTC(),
 			Activity:    typ,
 			InitiatorID: initiatorID,
@@ -34,32 +36,32 @@ func TestDefaultAccountManager_GetEvents(t *testing.T) {
 	accountID := "accountID"
 
 	t.Run("get empty events list", func(t *testing.T) {
-		events, err := manager.GetEvents(accountID, userID)
+		events, err := manager.GetEvents(context.Background(), accountID, userID)
 		if err != nil {
 			return
 		}
 		assert.Len(t, events, 0)
-		_ = manager.eventStore.Close() //nolint
+		_ = manager.eventStore.Close(context.Background()) //nolint
 	})
 
 	t.Run("get events", func(t *testing.T) {
 		generateAndStoreEvents(t, manager, activity.PeerAddedByUser, userID, "peer", accountID, 10)
-		events, err := manager.GetEvents(accountID, userID)
+		events, err := manager.GetEvents(context.Background(), accountID, userID)
 		if err != nil {
 			return
 		}
 
 		assert.Len(t, events, 10)
-		_ = manager.eventStore.Close() //nolint
+		_ = manager.eventStore.Close(context.Background()) //nolint
 	})
 
 	t.Run("get events without duplicates", func(t *testing.T) {
 		generateAndStoreEvents(t, manager, activity.UserJoined, userID, "", accountID, 10)
-		events, err := manager.GetEvents(accountID, userID)
+		events, err := manager.GetEvents(context.Background(), accountID, userID)
 		if err != nil {
 			return
 		}
 		assert.Len(t, events, 1)
-		_ = manager.eventStore.Close() //nolint
+		_ = manager.eventStore.Close(context.Background()) //nolint
 	})
 }

@@ -84,10 +84,14 @@ func (a *Auth) SaveConfigIfSSOSupported(listener SSOListener) {
 func (a *Auth) saveConfigIfSSOSupported() (bool, error) {
 	supportsSSO := true
 	err := a.withBackOff(a.ctx, func() (err error) {
-		_, err = internal.GetDeviceAuthorizationFlowInfo(a.ctx, a.config.PrivateKey, a.config.ManagementURL)
-		if s, ok := gstatus.FromError(err); ok && s.Code() == codes.NotFound {
-			_, err = internal.GetPKCEAuthorizationFlowInfo(a.ctx, a.config.PrivateKey, a.config.ManagementURL)
-			if s, ok := gstatus.FromError(err); ok && s.Code() == codes.NotFound {
+		_, err = internal.GetPKCEAuthorizationFlowInfo(a.ctx, a.config.PrivateKey, a.config.ManagementURL, nil)
+		if s, ok := gstatus.FromError(err); ok && (s.Code() == codes.NotFound || s.Code() == codes.Unimplemented) {
+			_, err = internal.GetDeviceAuthorizationFlowInfo(a.ctx, a.config.PrivateKey, a.config.ManagementURL)
+			s, ok := gstatus.FromError(err)
+			if !ok {
+				return err
+			}
+			if s.Code() == codes.NotFound || s.Code() == codes.Unimplemented {
 				supportsSSO = false
 				err = nil
 			}
@@ -158,7 +162,7 @@ func (a *Auth) login(urlOpener URLOpener) error {
 
 	// check if we need to generate JWT token
 	err := a.withBackOff(a.ctx, func() (err error) {
-		needsLogin, err = internal.IsLoginRequired(a.ctx, a.config.PrivateKey, a.config.ManagementURL, a.config.SSHKey)
+		needsLogin, err = internal.IsLoginRequired(a.ctx, a.config)
 		return
 	})
 	if err != nil {
@@ -189,7 +193,7 @@ func (a *Auth) login(urlOpener URLOpener) error {
 }
 
 func (a *Auth) foregroundGetTokenInfo(urlOpener URLOpener) (*auth.TokenInfo, error) {
-	oAuthFlow, err := auth.NewOAuthFlow(a.ctx, a.config)
+	oAuthFlow, err := auth.NewOAuthFlow(a.ctx, a.config, false)
 	if err != nil {
 		return nil, err
 	}
@@ -201,8 +205,8 @@ func (a *Auth) foregroundGetTokenInfo(urlOpener URLOpener) (*auth.TokenInfo, err
 
 	go urlOpener.Open(flowInfo.VerificationURIComplete)
 
-	waitTimeout := time.Duration(flowInfo.ExpiresIn)
-	waitCTX, cancel := context.WithTimeout(a.ctx, waitTimeout*time.Second)
+	waitTimeout := time.Duration(flowInfo.ExpiresIn) * time.Second
+	waitCTX, cancel := context.WithTimeout(a.ctx, waitTimeout)
 	defer cancel()
 	tokenInfo, err := oAuthFlow.WaitToken(waitCTX, flowInfo)
 	if err != nil {
